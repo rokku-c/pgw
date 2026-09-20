@@ -9,8 +9,11 @@ import { probeMcp, executeMcp } from "./mcp";
 
 await db.initialize();
 let running: {id:string;cancel:()=>void}|undefined;
-(globalThis as any).onmessage=async(event:MessageEvent)=>{
-  const message=event.data;
+// Transport shim. Spawned as a child process (`__job`) we speak Bun IPC via
+// `process.send`; as an in-thread Worker we fall back to the global postMessage
+// pair. Only one of the two is ever present.
+const reply=(message:unknown)=>{if(typeof process.send==="function")process.send(message);else (globalThis as any).postMessage(message);};
+const deliver=async(message:any)=>{
   if(message?.type==="cancel"&&message.id===running?.id){running?.cancel();return;}
   if(message?.type!=="run"||typeof message.id!=="string"||running)return;
   const id=message.id,context=jobContext(id);running={id,cancel:context.cancel};
@@ -46,5 +49,7 @@ let running: {id:string;cancel:()=>void}|undefined;
     const job=await db.getRepository(JobSchema).findOneBy({id});
     const code=error instanceof ApiError?error.code:error instanceof Error?error.message.slice(0,160):"job_failed";
     await db.getRepository(JobSchema).update(id,{status:context.context.signal.aborted||code==="job_cancelled"?(job?.kind==="mcp.debug"?"uncertain":"cancelled"):"failed",phase:"stopped",error:code,endedAt:Date.now(),updatedAt:Date.now()});
-  }finally{context.close();running=undefined;(globalThis as any).postMessage({type:"done",id});}
+  }finally{context.close();running=undefined;reply({type:"done",id});}
 };
+if(typeof process.send==="function")process.on("message",message=>void deliver(message));
+else (globalThis as any).onmessage=(event:MessageEvent)=>void deliver(event.data);

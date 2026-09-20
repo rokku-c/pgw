@@ -1,0 +1,167 @@
+name: release
+
+# Builds the gateway binary and the desktop shell for each supported platform,
+# attaches them to a GitHub Release, and publishes the npm packages.
+#
+# Note on verification: the desktop shell cannot be built on a machine without a
+# Rust toolchain, and a Linux shell cannot be built on macOS at all. Everything
+# below the `binary` job has therefore only ever run in CI — treat the first run
+# as the real test of the Tauri half.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.4
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun run i18n:check
+
+  binary:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, target: darwin-arm64 }
+          - { runner: macos-13, target: darwin-x64 }
+          - { runner: ubuntu-24.04, target: linux-x64 }
+          - { runner: ubuntu-24.04-arm, target: linux-arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.4
+      - run: bun install --frozen-lockfile
+      - run: bun scripts/build.ts --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/bin/pgw-${{ matrix.target }}
+          if-no-files-found: error
+
+  desktop:
+    needs: binary
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, target: darwin-arm64, triple: aarch64-apple-darwin }
+          - { runner: macos-13, target: darwin-x64, triple: x86_64-apple-darwin }
+          - { runner: ubuntu-24.04, target: linux-x64, triple: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-24.04-arm, target: linux-arm64, triple: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Tauri's externalBin resolves `binaries/pgw` to `binaries/pgw-<triple>`,
+      # so the gateway binary has to land under that name before the build.
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: src-tauri/binaries
+      - run: mv src-tauri/binaries/pgw-${{ matrix.target }} src-tauri/binaries/pgw-${{ matrix.triple }}
+      - run: chmod +x src-tauri/binaries/pgw-${{ matrix.triple }}
+
+      - name: Linux webview dependencies
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libayatana-appindicator3-dev || sudo apt-get install -y libappindicator3-dev
+
+      - name: Build the desktop shell
+        working-directory: src-tauri
+        run: bunx @tauri-apps/cli@^2 build
+
+      # One archive per platform, unpacked by `pgw open` on first use.
+      - name: Package for release
+        run: |
+          set -euo pipefail
+          mkdir -p dist/desktop
+          if [ "${{ startsWith(matrix.target, 'darwin') }}" = "true" ]; then
+            tar -czf "dist/desktop/pgw-desktop-${{ matrix.target }}.tar.gz" \
+              -C "src-tauri/target/release/bundle/macos" "Personal Gateway.app"
+          else
+            APPIMAGE=$(find src-tauri/target/release/bundle/appimage -name '*.AppImage' | head -1)
+            cp "$APPIMAGE" "dist/desktop/Personal Gateway.AppImage"
+            tar -czf "dist/desktop/pgw-desktop-${{ matrix.target }}.tar.gz" \
+              -C dist/desktop "Personal Gateway.AppImage"
+            rm -f "dist/desktop/Personal Gateway.AppImage"
+          fi
+          ls -lh dist/desktop
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: dist/desktop/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [binary, desktop]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: dist/desktop
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist/bin
+          merge-multiple: true
+
+      - name: Attach platform archives to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/desktop/*.tar.gz
+          generate_release_notes: true
+
+      # `pgw open` fetches these by tag, so the binaries must be published under
+      # the tag the installed package pins to.
+      - name: Verify every platform archive exists
+        run: |
+          set -euo pipefail
+          for t in darwin-arm64 darwin-x64 linux-x64 linux-arm64; do
+            test -f "dist/desktop/pgw-desktop-$t.tar.gz" || { echo "missing desktop-$t"; exit 1; }
+          done
+
+      - run: bun scripts/pack.ts
+      # `bun publish` reads the same registry config as `bun install`.
+      - name: Publish to npm
+        env:
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          for dir in dist/npm/*/; do
+            echo "→ $dir"
+            bun publish --access public --cwd "$dir"
+          done

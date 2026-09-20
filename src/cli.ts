@@ -1,19 +1,18 @@
 #!/usr/bin/env bun
-import { spawn } from "node:child_process";
 import { mkdir, chmod, open, realpath, rm } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { homedir } from "node:os";
 import assert from "node:assert/strict";
-import { adminToken, home, address, port } from "./server/config";
+import { adminToken, home, address, port, version } from "./server/config";
+import { spawnDetached } from "./server/self";
+import { desktopApp, installDesktop } from "./server/desktop";
 import { costMicros } from "./server/budget";
 import { parseSessionLine } from "./server/session-parser";
 import { mcpAlias } from "./server/mcp";
 import { protocolBase } from "./shared/endpoints";
 import type { ModelRoute, PublicClient } from "./shared/types";
 
-const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
 let accessId: string | undefined;
 if (args[0] === "--access") { accessId = args[1]; if (!accessId) throw new Error("pgw --access CLIENT_ID claude|codex"); args.splice(0, 2); }
@@ -30,8 +29,7 @@ async function request<T>(path: string, method = "GET", body?: unknown): Promise
 async function ensureServer() {
   try { await request("/status"); return; } catch (error) { if ((error as Error).message === "unauthorized") throw error; }
   const log = await open(join(home, "server.log"), "a", 0o600);
-  const child = spawn(process.execPath, [join(root, "src/server/index.ts")], { cwd: root, detached: true, stdio: ["ignore", log.fd, log.fd], env: { ...process.env, PGW_HOME: home, PGW_PORT: String(port) } });
-  child.unref();
+  spawnDetached("__serve", { log: log.fd, env: { PGW_HOME: home, PGW_PORT: String(port) } });
   await log.close();
   for (let attempt = 0; attempt < 80; attempt++) {
     await Bun.sleep(150);
@@ -117,18 +115,72 @@ async function wrap(agent: "claude" | "codex" | "pi", raw: string[]) {
     finally { process.off("SIGINT", interrupt); process.off("SIGTERM", terminate); }
   } finally { if (mcpConfig) await rm(dirname(mcpConfig), { recursive: true, force: true }); await request(`/clients/${client.id}`, "DELETE").catch(error => console.error(`Credential cleanup: ${error.message}`)); }
 }
+/**
+ * Open the console in the desktop shell, installing it on first use.
+ *
+ * Returns false when the caller should fall back to a browser tab — either
+ * because `PGW_NO_GUI=1`, or because the shell could not be fetched (offline,
+ * no release for this platform). The browser is always a working fallback, so a
+ * failed download degrades rather than blocking.
+ */
+async function launchDesktop(url: string): Promise<boolean> {
+  if (process.env.PGW_NO_GUI === "1") return false;
+  let app = desktopApp();
+  if (!app) {
+    try { app = await installDesktop(message => console.error(message)); }
+    catch (error) { console.error(`${(error as Error).message}\nFalling back to the browser.`); return false; }
+  }
+  await openExternal(process.platform === "darwin" ? ["open", "-a", app] : [app], url);
+  return true;
+}
+async function openExternal(argv: string[], fallback: string) {
+  try { await Bun.spawn(argv, { stdout: "ignore", stderr: "inherit" }).exited; }
+  catch { console.log(fallback); }
+}
+const USAGE = `pgw ${version} — Personal Gateway
+
+  pgw                        Open the console (starts the gateway if needed)
+  pgw start                  Run the gateway in the foreground
+  pgw status | doctor        Health and diagnostics
+
+  pgw claude | codex | pi    Launch an agent CLI through the gateway
+  pgw run AGENT --goal TEXT  Run an agent headlessly
+  pgw pause|resume|stop|complete RUN_ID
+  pgw steer RUN_ID MESSAGE
+
+  pgw scan                   Scan the local agent registry
+  pgw sources                List collection sources
+  pgw source add PATH --name NAME [--capture] [--learn]
+  pgw source pause|scan ID
+  pgw sessions [--query Q] [--agent A] [--offset N]
+  pgw persona [timeline | history ID]
+  pgw jobs                   List background jobs
+  pgw export                 Export the asset inventory
+
+  pgw mcp [calls | approve ID | deny ID | cancel ID]
+  pgw approvals | approve ID | deny ID
+
+Environment: PGW_HOME, PGW_PORT, PGW_MODEL, PGW_NO_GUI, PGW_APP`;
+
 try {
   const command = args[0] || "open";
-  if (["claude", "codex", "pi"].includes(command)) await wrap(command as "claude" | "codex" | "pi", args.slice(1));
+  // Hidden verbs. The compiled binary re-runs itself as its own server and job
+  // runner; these are not user-facing and are deliberately absent from usage.
+  if (command === "__serve") await import("./server/index");
+  else if (command === "__job") await import("./server/job-worker");
+  else if (["--help", "-h", "help"].includes(command)) console.log(USAGE);
+  else if (["--version", "-v", "version"].includes(command)) console.log(version);
+  else if (["claude", "codex", "pi"].includes(command)) await wrap(command as "claude" | "codex" | "pi", args.slice(1));
   else if (command === "start") {
-    const child = Bun.spawn([process.execPath, join(root, "src/server/index.ts")], { cwd: root, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
-    const stop = () => child.kill("SIGTERM"); process.on("SIGINT", stop); process.on("SIGTERM", stop);
-    process.exitCode = await child.exited;
+    await import("./server/index");
   } else if (command === "open") {
     await ensureServer();
     const url = `${address}/#token=${adminToken}`;
-    if (process.platform === "darwin") await Bun.spawn(["open", url], { stdout: "ignore", stderr: "inherit" }).exited;
-    else console.log(url);
+    if (!await launchDesktop(url)) {
+      if (process.platform === "darwin") await openExternal(["open", url], url);
+      else if (process.platform === "linux" && Bun.which("xdg-open")) await openExternal(["xdg-open", url], url);
+      else console.log(url);
+    }
   } else if (command === "doctor") await doctor();
   else if (command === "status") console.log(JSON.stringify(await request("/status"), null, 2));
   else if (command === "scan") { await ensureServer(); console.log(JSON.stringify(await request("/registry/scan", "POST"), null, 2)); }
@@ -152,6 +204,7 @@ try {
     else console.log(JSON.stringify(await request("/preferences"), null, 2));
   }
   else if (command === "export") console.log(JSON.stringify(await request("/inventory"), null, 2));
+  else if (command === "jobs") console.log(JSON.stringify(await request("/jobs"), null, 2));
   else if (["stop", "pause", "complete"].includes(command)) { if (!args[1]) throw new Error(`pgw ${command} RUN_ID`); console.log(await request(`/runs/${args[1]}/${command}`, "POST")); }
   else if (command === "resume") {
     if (!args[1]) throw new Error("pgw resume RUN_ID [--message TEXT] [--extra-turns N] [--extra-seconds N]");
@@ -181,5 +234,5 @@ try {
       controls: { mode: values["single-turn"] ? "turn" : "goal", maxTurns: Number(values["max-turns"]), permission: values.permission,
         budgetMicros: values["budget-usd"] ? Math.round(Number(values["budget-usd"]) * 1000000) : null, tokenLimit: values["token-limit"] ? Number(values["token-limit"]) : null,
         completionFiles: (values["completion-file"] || []).map(path => ({ path })) } }), null, 2));
-  } else throw new Error("pgw open | start | status | doctor | scan | export | claude | codex | pi | run | pause | resume | steer | stop | complete | approvals | approve | deny");
+  } else throw new Error(`Unknown command: ${command}. Run \`pgw --help\`.`);
 } catch (error) { console.error(error instanceof Error ? error.message : error); process.exitCode = 1; }

@@ -10,6 +10,9 @@
     "dev": "NODE_ENV=development bun --hot src/server/index.ts",
     "start": "bun src/server/index.ts",
     "build": "bun scripts/build.ts",
+    "build:all": "bun scripts/build.ts --all",
+    "pack": "bun scripts/pack.ts",
+    "icons": "bash scripts/icons.sh",
     "check": "tsc --noEmit",
     "doctor": "bun src/cli.ts doctor",
     "i18n:check": "bun scripts/check-locales.ts"

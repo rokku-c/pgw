@@ -1,9 +1,10 @@
 import { db, JobSchema, record, audit, SourceSchema, SessionSchema } from "./store";
 import { atomic } from "./transactions";
 import { encrypt, decrypt, hash, ApiError } from "./security";
+import { LaneRunner } from "./job-lane";
 import type { BackgroundJob, JobKind, PublicJob } from "../shared/types";
 
-type Lane = { worker?: Worker; current: string | null; ticking: boolean; kinds: JobKind[] };
+type Lane = { worker?: LaneRunner; current: string | null; ticking: boolean; kinds: JobKind[] };
 const lanes: Lane[] = [
   { current:null,ticking:false,kinds:["sessions.search"] },
   { current:null,ticking:false,kinds:["registry.scan","sessions.scan","provider.probe","mcp.probe"] },
@@ -55,10 +56,10 @@ async function tick() {
       if(!job)return;
       lane.current=job.id;
       if(!lane.worker){
-        lane.worker=new Worker(new URL("./job-worker.ts",import.meta.url).href,{type:"module"});
-        lane.worker.onmessage=event=>{if(event.data?.type==="done"&&event.data.id===lane.current){lane.current=null;void tick();}};
-        lane.worker.onerror=event=>{
-          console.error("Job worker",event.message);const id=lane.current;lane.current=null;lane.worker?.terminate();lane.worker=undefined;
+        lane.worker=new LaneRunner();
+        lane.worker.onmessage=event=>{if(event?.type==="done"&&event.id===lane.current){lane.current=null;void tick();}};
+        lane.worker.onerror=message=>{
+          console.error("Job worker",message);const id=lane.current;lane.current=null;lane.worker?.terminate();lane.worker=undefined;
           if(id)void db.getRepository(JobSchema).update(id,{status:"uncertain",error:"worker_stopped",endedAt:Date.now(),updatedAt:Date.now()});
         };
       }

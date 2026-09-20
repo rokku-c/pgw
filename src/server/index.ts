@@ -29,10 +29,21 @@ async function handle(request: Request, handler: (request: Request) => Promise<R
     return Response.json({ error: { code, message: code, ...(error instanceof z.ZodError ? { fields: error.issues.map(i => i.path.join(".")) } : {}) } }, { status, headers: { "cache-control": "no-store", ...(error instanceof ApiError && error.requestId ? { "x-pgw-request-id": error.requestId } : {}) } });
   }
 }
+// Bun routes the HTML's `<script>` and stylesheet chunks for us, but not other
+// embedded assets — notably `<link rel="icon">` — so a compiled binary answers
+// the favicon with a 404. Register the remainder by their embedded names.
+const embeddedAssets: Record<string, Response> = {};
+// Bun's runtime gives each embedded file a `name`, but bun-types declares only
+// `Blob`, so the property has to be asserted.
+for (const file of (Bun.embeddedFiles ?? []) as (Blob & { name?: string })[]) {
+  if (file.name && !/\.(js|css)$/.test(file.name)) embeddedAssets[`/${file.name}`] = new Response(file);
+}
+
 const server = Bun.serve({
   hostname: "127.0.0.1", port, idleTimeout: 255,
   development: process.env.NODE_ENV === "development" ? { hmr: true, console: true } : false,
   routes: {
+    ...embeddedAssets,
     "/": page,
     "/app": page,
     "/app/*": page,

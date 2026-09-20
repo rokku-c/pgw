@@ -5,3 +5,10 @@ dist/
 .env.*
 *.log
 .DS_Store
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+# Populated by CI with the compiled gateway binary before `tauri build`;
+# the binary is a build input, not source.
+src-tauri/binaries/

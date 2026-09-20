@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Personal Gateway</title>
+    <style>
+      /* Never shown in normal operation: the window is created against the
+         gateway's own URL. This exists so `frontendDist` resolves at build time,
+         and as the page Tauri falls back to if window creation is retried. */
+      html, body { height: 100%; margin: 0; background: #080b10; color: #8b95a5;
+        font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      body { display: grid; place-items: center; }
+    </style>
+  </head>
+  <body>
+    <p>Starting Personal Gateway…</p>
+  </body>
+</html>

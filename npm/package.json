@@ -1,0 +1,35 @@
+{
+  "name": "@rokku-c/pgw",
+  "version": "0.1.0",
+  "description": "Local gateway for agent CLIs — provider routing, MCP tools, session memory, and a desktop console",
+  "type": "module",
+  "bin": {
+    "pgw": "bin/pgw.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@rokku-c/pgw-darwin-arm64": "0.1.0",
+    "@rokku-c/pgw-darwin-x64": "0.1.0",
+    "@rokku-c/pgw-linux-x64": "0.1.0",
+    "@rokku-c/pgw-linux-arm64": "0.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rokku-c/pgw.git"
+  },
+  "homepage": "https://github.com/rokku-c/pgw",
+  "keywords": [
+    "llm",
+    "gateway",
+    "mcp",
+    "agent",
+    "claude",
+    "codex"
+  ]
+}
