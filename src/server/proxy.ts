@@ -1,0 +1,239 @@
+import { z } from "zod";
+import { db, ClientSchema, RouteSchema, ProviderSchema, TrafficSchema, PreferenceSchema, record, setting, audit } from "./store";
+import { ApiError, bearer, hash, readJson } from "./security";
+import { endpoint, upstreamHeaders } from "./providers";
+import { boundOutput, reserveBudget, settleBudget } from "./budget";
+import { emptyUsage, mergeUsage, usageCost, type Usage } from "./usage";
+import { convertRequest, convertResponse } from "./protocols";
+import { StreamConversion } from "./stream-conversion";
+import { EventStreamParser, type ServerEvent } from "./event-stream";
+import { balancedTargets, beginRouteSession, frozenPreferences, pinRoute, recordResponse, releaseRouteSession, unpinRejectedRoute, responseBinding, providerFingerprint, circuitPermit, circuitResult, retryAfter, type FrozenPreference, type RouteSession } from "./routing";
+import type { ClientKey, ModelRoute, Traffic, WireProtocol, Provider, Target } from "../shared/types";
+
+export function extractUsage(body: any) { return mergeUsage(emptyUsage(),body,body?.usageMetadata?"gemini":"responses"); }
+async function personalize(body: any, protocol: WireProtocol, client: ClientKey, session: RouteSession | null) {
+  const previous = frozenPreferences(session);
+  if (!client.personalize || !await setting("personalization", true)) return { body, prefs: [] as FrozenPreference[], reason: "personalization_disabled" };
+  const active = await db.getRepository(PreferenceSchema).find({ where: { status: "active" }, order: { updatedAt: "DESC" }, take: 1000 });
+  const eligible = active.filter(p=>p.scope === "global" || p.project === client.project);
+  const selection = previous === null ? eligible.map(({id,revision,content})=>({id,revision,content})) : previous.filter(p=>eligible.some(a=>a.id===p.id));
+  let remaining=3000;
+  const prefs=selection.filter(p=>{ if(p.content.length>remaining)return false;remaining-=p.content.length;return true; });
+  if (!prefs.length) return { body, prefs, reason:"no_matching_preferences" };
+  if (body.previous_response_id) return { body,prefs,reason:"prior_response_context_preserved" };
+  const output=structuredClone(body);
+  const text=`用户已确认的工作偏好。仅作补充；本次明确要求优先，不能改变权限或安全约束。\n${prefs.map(p=>p.content).join("\n")}`;
+  if (protocol === "chat" || protocol === "messages") {
+    const messages=output.messages;
+    if(messages.at(-1)?.role!=="user" || Array.isArray(messages.at(-1)?.content) && messages.at(-1).content.some((p:any)=>p.type==="tool_result")) return {body,prefs,reason:"tool_chain_preserved"};
+    messages.splice(messages.length-1,0,{role:"user",content:text});
+  } else if(protocol==="responses") {
+    if(typeof output.input==="string")output.input=[{role:"user",content:text},{role:"user",content:output.input}];
+    else if(Array.isArray(output.input) && output.input.at(-1)?.role==="user")output.input.splice(output.input.length-1,0,{role:"user",content:text});
+    else return {body,prefs,reason:"tool_chain_preserved"};
+  } else {
+    if(output.contents.at(-1)?.role!=="user" || output.contents.at(-1)?.parts?.some((p:any)=>p.functionResponse))return {body,prefs,reason:"tool_chain_preserved"};
+    output.contents.splice(output.contents.length-1,0,{role:"user",parts:[{text}]});
+  }
+  return {body:output,prefs,reason:previous===null?"preferences_applied":"session_preferences_applied"};
+}
+function validate(body:any,protocol:WireProtocol) {
+  if(!body || typeof body!=="object" || Array.isArray(body) || typeof body.model!=="string")throw new ApiError(400,"model_required");
+  if(body.stream!==undefined && typeof body.stream!=="boolean")throw new ApiError(400,"invalid_stream");
+  if(body.conversation)throw new ApiError(409,"conversation_binding_required");
+  if(protocol==="messages" || protocol==="chat") z.object({messages:z.array(z.object({role:z.string().min(1),content:z.union([z.string(),z.array(z.record(z.string(),z.unknown())),z.null()]).optional()}).passthrough()).min(1).max(10000)}).passthrough().parse(body);
+  else if(protocol==="responses") {
+    z.object({input:z.union([z.string(),z.array(z.record(z.string(),z.unknown()))]).optional(),previous_response_id:z.string().min(1).max(300).optional(),background:z.boolean().optional()}).passthrough().parse(body);
+    if(body.background)throw new ApiError(400,"background_mode_requires_async_adapter");
+  } else z.object({contents:z.array(z.object({role:z.string().optional(),parts:z.array(z.record(z.string(),z.unknown()))}).passthrough()).min(1).max(10000)}).passthrough().parse(body);
+}
+async function responseOperation(request:Request,client:ClientKey,id:string) {
+  if(!["GET","DELETE"].includes(request.method))throw new ApiError(405,"method_not_supported");
+  const {provider,binding}=await responseBinding(client,id);
+  const result=await fetch(endpoint(provider,`/responses/${encodeURIComponent(id)}`),{method:request.method,headers:upstreamHeaders(provider),redirect:"error",signal:AbortSignal.any([request.signal,AbortSignal.timeout(15000)])});
+  const text=await result.text();
+  if(request.method==="DELETE" && result.ok)await db.query('DELETE FROM response_bindings WHERE ownerKey=? AND responseId=?',[client.runId?`run:${client.runId}`:`client:${client.id}`,id]);
+  await audit(request.method==="GET"?"response.retrieved":"response.deleted",binding.affinityId,{status:result.status});
+  return new Response(text,{status:result.status,headers:{"content-type":"application/json"}});
+}
+export async function proxy(request:Request):Promise<Response> {
+  const key=bearer(request)||request.headers.get("x-goog-api-key")||"";
+  const client=key?await db.getRepository(ClientSchema).findOneBy({keyHash:hash(key),enabled:true}):null;
+  if(!client || client.expiresAt!==null && client.expiresAt<=Date.now())throw new ApiError(401,"invalid_api_key");
+  const url=new URL(request.url);
+  let path=url.pathname;
+  const prefix=path.match(/^\/providers\/(openai|anthropic|google|gemini)(\/.*)$/);
+  if(prefix){
+    path=prefix[2];
+    if(prefix[1]==="openai" && !["/v1/models","/v1/responses","/v1/chat/completions"].includes(path) && !path.startsWith("/v1/responses/"))throw new ApiError(404,"protocol_endpoint_mismatch");
+    if(prefix[1]==="anthropic" && path!=="/v1/messages")throw new ApiError(404,"protocol_endpoint_mismatch");
+    if(["google","gemini"].includes(prefix[1]) && !path.startsWith("/v1beta/models/"))throw new ApiError(404,"protocol_endpoint_mismatch");
+  }
+  const operation=path.match(/^\/v1\/responses\/([A-Za-z0-9_-]{1,300})$/);
+  if(operation)return responseOperation(request,client,operation[1]);
+  const allowed=(await db.getRepository(RouteSchema).findBy({enabled:true})).filter(r=>!client.routeIds.length || client.routeIds.includes(r.id));
+  if(path==="/v1/models" && request.method==="GET")return Response.json({object:"list",data:allowed.map(r=>({id:r.alias,object:"model",owned_by:"personal-gateway"}))});
+  const gemini=path.match(/^\/v1beta\/models\/(.+):(generateContent|streamGenerateContent)$/);
+  const protocol:WireProtocol|undefined=gemini?"gemini":({"/v1/responses":"responses","/v1/chat/completions":"chat","/v1/messages":"messages"} as Record<string,WireProtocol>)[path];
+  if(!protocol || request.method!=="POST")throw new ApiError(404,"endpoint_not_found");
+  const original=await readJson(request,16*1024*1024);
+  if(gemini && original && typeof original==="object" && !Array.isArray(original)){ original.model=decodeURIComponent(gemini[1]);original.stream=gemini[2]==="streamGenerateContent"; }
+  validate(original,protocol);
+  const route=allowed.find(r=>r.alias===original.model);
+  if(!route)throw new ApiError(404,"model_not_available");
+  if(!route.targets.length)throw new ApiError(503,"route_unavailable");
+  const group=crypto.randomUUID();
+  const session=await beginRouteSession(client,{...route,protocol},request.headers.get("x-pgw-session"),original.previous_response_id,group);
+  let detached=false,uncertain=false;
+  const decisions:Traffic["decisions"]=[];
+  try {
+    const {body,prefs,reason}=await personalize(original,protocol,client,session);
+    decisions.push({action:"personalization",reason});
+    const outputTokens=boundOutput(body,{...route,protocol});
+    await db.getRepository(ClientSchema).update(client.id,{lastUsedAt:Date.now()});
+    let lastError:ApiError|undefined;
+    if(session?.providerId && !route.targets.some(t=>t.providerId===session.providerId && t.model===session.model))throw new ApiError(409,"pinned_target_removed");
+    const targets=session?.providerId?route.targets.filter(t=>t.providerId===session.providerId && t.model===session.model):await balancedTargets(route);
+    for(const target of targets) {
+      const provider=await db.getRepository(ProviderSchema).findOneBy({id:target.providerId,enabled:true});
+      if(!provider){ decisions.push({action:"skip",target:target.providerId,reason:"provider_disabled"});continue; }
+      const upstreamWire:WireProtocol=target.protocol||(provider.protocol==="anthropic"?"messages":provider.protocol==="gemini"?"gemini":protocol==="responses"?"responses":"chat");
+      const converted=upstreamWire!==protocol;
+      let upstreamPayload:any;
+      try{upstreamPayload=converted?convertRequest(body,protocol,upstreamWire,target.model):{...body,model:target.model};}
+      catch(error){if(error instanceof ApiError){lastError=error;decisions.push({action:"skip",target:provider.id,reason:error.code});continue;}throw error;}
+      if(converted)decisions.push({action:"convert",target:provider.id,reason:`${protocol}→${upstreamWire}:${body.stream?"stream":"json"}`});
+      if(session?.providerFingerprint && session.providerFingerprint!==providerFingerprint(provider))throw new ApiError(409,"pinned_provider_changed");
+      const circuit=await circuitPermit(provider,target.model);
+      decisions.push({action:circuit.allowed?"select":"skip",target:provider.id,reason:session?.providerId?`session_pinned:${circuit.reason}`:circuit.reason});
+      if(!circuit.allowed){ lastError=new ApiError(503,"circuit_open");continue; }
+      const started=Date.now();
+      const traffic:Traffic={...record(),clientId:client.id,clientName:client.name,routeId:route.id,model:route.alias,providerId:provider.id,providerName:provider.name,protocol,status:"running",upstreamStatus:null,latencyMs:null,firstByteMs:null,...emptyUsage(),costMicros:null,error:null,stream:!!body.stream,project:client.project,patchIds:prefs.map(p=>`${p.id}:${p.revision}`),runId:client.runId,accounting:"pending",pricing:{input:route.inputPrice,output:route.outputPrice,cacheRead:route.cacheReadPrice,cacheWrite:route.cacheWritePrice,cacheWriteLong:route.cacheWriteLongPrice},requestGroupId:group,affinityId:session?.id||null,responseId:null,decisions:[...decisions]};
+      try{ await reserveBudget(traffic.id,client,route,outputTokens,{key:`${route.id}:${target.providerId}:${target.model}`,maxConcurrent:target.maxConcurrent}); await db.getRepository(TrafficSchema).save(traffic); }
+      catch(error){ await settleBudget(traffic.id,traffic,true);await circuitResult(circuit.id,false,null);if(error instanceof ApiError&&error.code==="target_concurrency_limit"){decisions.push({action:"skip",target:provider.id,reason:error.code});continue;}throw error; }
+      const controller=new AbortController();
+      let idleTimer:ReturnType<typeof setTimeout>,output:ReadableStreamDefaultController<Uint8Array>|undefined,reader:ReadableStreamDefaultReader<Uint8Array>|undefined;
+      const touch=()=>{clearTimeout(idleTimer);idleTimer=setTimeout(()=>controller.abort(new Error("upstream_idle_timeout")),60000);};touch();
+      const timeout=setTimeout(()=>controller.abort(new Error("upstream_timeout")),300000);
+      let submitted=false,rejected=true,terminal=false,responseStatus="unknown",usage=emptyUsage(),failure:string|null=null;
+      let finishPromise:Promise<void>|undefined;
+      const cancel=()=>controller.abort(new Error("client_cancelled"));
+      request.signal.addEventListener("abort",cancel,{once:true});
+      const finish=(status:Traffic["status"],error:string|null=null):Promise<void>=>{
+        if(finishPromise)return finishPromise;
+        finishPromise=(async()=>{
+          clearTimeout(timeout);clearTimeout(idleTimer);request.signal.removeEventListener("abort",cancel);controller.signal.removeEventListener("abort",aborted);
+          const knownRejected=!submitted||rejected;
+          Object.assign(traffic,usage);
+          if(knownRejected){traffic.inputTokens=0;traffic.outputTokens=0;traffic.costMicros=0;}
+          else if(terminal&&status==="completed")traffic.costMicros=usageCost(usage,traffic.pricing);
+          traffic.accounting=knownRejected?"rejected":terminal&&status==="completed"&&usage.inputTokens!==null&&usage.outputTokens!==null?"reported":"estimated";
+          uncertain=submitted&&!rejected&&!terminal;
+          await settleBudget(traffic.id,terminal&&status==="completed"?traffic:{inputTokens:null,outputTokens:null,costMicros:null},knownRejected);
+          if(terminal && protocol==="responses" && upstreamWire==="responses" && traffic.responseId)await recordResponse(session,traffic.responseId,target,provider,responseStatus,group);
+          if(knownRejected)await unpinRejectedRoute(session,group);
+          await db.getRepository(TrafficSchema).update(traffic.id,{status,error,latencyMs:Date.now()-started,firstByteMs:traffic.firstByteMs,upstreamStatus:traffic.upstreamStatus,inputTokens:traffic.inputTokens,outputTokens:traffic.outputTokens,cacheReadTokens:traffic.cacheReadTokens,cacheWriteTokens:traffic.cacheWriteTokens,cacheWriteLongTokens:traffic.cacheWriteLongTokens,reasoningTokens:traffic.reasoningTokens,costMicros:traffic.costMicros,accounting:traffic.accounting,responseId:traffic.responseId,updatedAt:Date.now()});
+          const upstreamFailure=error && error!=="client_cancelled" && ![400,401,403,404,413,422].includes(traffic.upstreamStatus||0)?error:null;
+          await circuitResult(circuit.id,status==="completed",upstreamFailure,traffic.upstreamStatus===429?cooldown:null);
+        })();
+        return finishPromise;
+      };
+      let cooldown:number|null=null;
+      const aborted=()=>{
+        const reason=request.signal.aborted?"client_cancelled":controller.signal.reason?.message||"upstream_interrupted";
+        void (async()=>{try{await reader?.cancel();await finish(request.signal.aborted?"cancelled":"failed",reason);if(detached)await releaseRouteSession(session,group,uncertain);output?.error(new Error(reason));}catch(error){console.error("Stream cleanup",error);output?.error(error);}})();
+      };
+      controller.signal.addEventListener("abort",aborted,{once:true});
+      try {
+        if(request.signal.aborted)throw new ApiError(499,"client_cancelled");
+        await pinRoute(session,target,provider,prefs,group);
+        const payload=upstreamPayload;
+        if(converted&&upstreamWire!=="gemini")payload.stream=!!body.stream;
+        let upstreamPath=upstreamWire==="responses"?"/responses":upstreamWire==="chat"?"/chat/completions":"/messages";
+        if(upstreamWire==="gemini"){delete payload.model;delete payload.stream;upstreamPath=`/models/${encodeURIComponent(target.model)}:${body.stream?"streamGenerateContent?alt=sse":"generateContent"}`;}
+        if(upstreamWire==="chat"&&body.stream)payload.stream_options={...payload.stream_options,include_usage:true};
+        const headers=upstreamHeaders(provider);
+        const beta=request.headers.get("anthropic-beta");if(upstreamWire==="messages"&&beta&&!converted)headers.set("anthropic-beta",beta);
+        const reqId=request.headers.get("x-client-request-id");if(reqId&&reqId.length<=200)headers.set("x-client-request-id",reqId);
+        submitted=true;rejected=false;uncertain=true;
+        const response=await fetch(endpoint(provider,upstreamPath),{method:"POST",headers,body:JSON.stringify(payload),redirect:"error",signal:controller.signal});
+        touch();traffic.upstreamStatus=response.status;
+        if(!response.ok){
+          rejected=[400,401,403,404,413,422,429].includes(response.status);cooldown=retryAfter(response.headers.get("retry-after"));
+          await response.body?.cancel();await finish("failed",`upstream_${response.status}`);
+          lastError=new ApiError(response.status===429?429:502,`upstream_${response.status}`);
+          if(response.status===429 && !session?.providerId){decisions.push({action:"fallback",target:provider.id,reason:"explicit_rate_limit_rejection"});continue;}
+          throw lastError;
+        }
+        if(!body.stream){
+          if(!response.body)throw new ApiError(502,"empty_upstream_response");
+          reader=response.body.getReader();const chunks:Uint8Array[]=[];let size=0;
+          while(true){const next=await reader.read();if(next.done)break;touch();if(traffic.firstByteMs===null)traffic.firstByteMs=Date.now()-started;size+=next.value.length;if(size>32*1024*1024)throw new ApiError(502,"upstream_response_too_large");chunks.push(next.value);}
+          const text=Buffer.concat(chunks).toString("utf8");let parsed:any;
+          try{parsed=JSON.parse(text);}catch{throw new ApiError(502,"invalid_upstream_response");}
+          if(parsed.error)throw new ApiError(502,"upstream_error_body");
+          usage=mergeUsage(usage,parsed,upstreamWire);traffic.responseId=upstreamWire==="responses"&&typeof parsed.id==="string"?parsed.id:null;
+          responseStatus=upstreamWire==="responses"?(parsed.status||"completed"):"completed";
+          terminal=!['queued','in_progress'].includes(responseStatus);
+          if(!terminal)throw new ApiError(502,"unexpected_background_response");
+          const answer=converted?convertResponse(parsed,upstreamWire,protocol,route.alias):null;
+          await finish(responseStatus==="failed"?"failed":"completed",responseStatus==="failed"?"upstream_response_failed":null);
+          if(converted){return new Response(JSON.stringify(answer),{status:response.status,headers:{"content-type":"application/json","x-pgw-request-id":group,"x-pgw-attempt-id":traffic.id,"x-pgw-conversion":"json"}});}
+          return new Response(text,{status:response.status,headers:{"content-type":"application/json","x-pgw-request-id":group,"x-pgw-attempt-id":traffic.id}});
+        }
+        if(!response.body||!response.headers.get("content-type")?.includes("text/event-stream")){await response.body?.cancel();throw new ApiError(502,"invalid_upstream_stream");}
+        reader=response.body.getReader();
+        let produced=false;
+        const conversion=converted?new StreamConversion(upstreamWire,protocol,route.alias,chunk=>{produced=true;output?.enqueue(chunk);}):null;
+        const parse=(event:ServerEvent)=>{
+          if(conversion){conversion.accept(event);usage=conversion.usage;terminal=conversion.complete;responseStatus=conversion.status;traffic.responseId=protocol==="responses"?conversion.id:conversion.upstreamId;return;}
+          if(event.data==="[DONE]"){if(protocol==="chat")terminal=true;return;}
+          if(["ping","keepalive"].includes(event.event) && !event.data.startsWith("{"))return;
+          let item:any;try{item=JSON.parse(event.data);}catch{throw new ApiError(502,"invalid_upstream_event");}
+          usage=mergeUsage(usage,item,protocol);
+          if(protocol==="responses"){
+            if(typeof item.response?.id==="string")traffic.responseId=item.response.id;
+            if(["response.completed","response.incomplete","response.failed"].includes(item.type)){terminal=true;responseStatus=item.type.slice(9);if(item.type==="response.failed")failure="upstream_response_failed";}
+          }else if(protocol==="messages"&&item.type==="message_stop")terminal=true;
+          else if(protocol==="gemini"&&item.candidates?.length&&item.candidates.every((c:any)=>c.finishReason))terminal=true;
+          if(item.type==="error"||item.error){terminal=true;failure="upstream_stream_error";}
+        };
+        const parser=new EventStreamParser(parse);
+        detached=true;
+        const stream=new ReadableStream<Uint8Array>({
+          start(controller){output=controller;},
+          async pull(controller){
+            try{
+              produced=false;
+              while(!produced){
+                const next=await reader!.read();
+                if(next.done){
+                  const incomplete=parser.finish();if(incomplete)failure="truncated_upstream_event";
+                  if(conversion){if(failure)throw new ApiError(502,failure);conversion.finish();usage=conversion.usage;terminal=conversion.complete;responseStatus=conversion.status;}
+                  await finish(terminal&&!failure?"completed":"failed",failure||(!terminal?"stream_incomplete":null));await releaseRouteSession(session,group,uncertain);controller.close();return;
+                }
+                touch();if(traffic.firstByteMs===null)traffic.firstByteMs=Date.now()-started;
+                parser.push(next.value);
+                if(!conversion){controller.enqueue(next.value);produced=true;}
+              }
+            }catch(error){
+              const reason=error instanceof ApiError?error.code:controllerSignalReason();
+              await reader!.cancel().catch(()=>{});await finish(request.signal.aborted?"cancelled":"failed",reason);await releaseRouteSession(session,group,uncertain);
+              if(conversion&&!request.signal.aborted){conversion.fail(reason);controller.close();}else controller.error(new Error(reason));
+            }
+          },
+          async cancel(){await reader!.cancel().catch(()=>{});await finish("cancelled","client_cancelled");await releaseRouteSession(session,group,uncertain);controller.abort();},
+        });
+        function controllerSignalReason(){return request.signal.aborted?"client_cancelled":controller.signal.reason?.message||"stream_interrupted";}
+        return new Response(stream,{headers:{"content-type":"text/event-stream","cache-control":"no-cache","x-pgw-request-id":group,"x-pgw-attempt-id":traffic.id,"x-accel-buffering":"no",...(converted?{"x-pgw-conversion":"stream"}:{})}});
+      }catch(error){
+        await reader?.cancel().catch(()=>{});
+        await finish(request.signal.aborted?"cancelled":"failed",error instanceof ApiError?error.code:controller.signal.reason?.message||"upstream_unreachable");
+        if(error instanceof ApiError)throw error;
+        throw new ApiError(request.signal.aborted?499:502,request.signal.aborted?"client_cancelled":controller.signal.reason?.message||"upstream_unreachable");
+      }
+    }
+    await audit("routing.unavailable",group,{decisions});
+    throw lastError||new ApiError(503,"route_unavailable");
+  }catch(error){if(error instanceof ApiError)error.requestId=group;throw error;}finally{if(!detached)await releaseRouteSession(session,group,uncertain);}
+}
