@@ -26,7 +26,9 @@ export class LaneRunner {
     this.child = Bun.spawn([process.execPath, ...selfArgv("__job")], {
       ipc: message => this.onmessage?.(message),
       stdio: ["ignore", "inherit", "inherit"],
-      env: { ...process.env },
+      // Claim ownership so the runner exits if this process is killed outright
+      // instead of shutting down cleanly.
+      env: { ...process.env, PGW_PARENT_PID: String(process.pid) },
     });
     // Mirror Worker.onerror: surface an unexpected exit to the lane so it can mark
     // the in-flight job `uncertain` rather than leaving it stuck at `running`.

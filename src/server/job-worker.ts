@@ -6,6 +6,7 @@ import { scanRegistry } from "./collector";
 import { scanSessions, listSessions } from "./sessions";
 import { probeProvider } from "./providers";
 import { probeMcp, executeMcp } from "./mcp";
+import { exitWithParent } from "./self";
 
 await db.initialize();
 let running: {id:string;cancel:()=>void}|undefined;
@@ -53,3 +54,6 @@ const deliver=async(message:any)=>{
 };
 if(typeof process.send==="function")process.on("message",message=>void deliver(message));
 else (globalThis as any).onmessage=(event:MessageEvent)=>void deliver(event.data);
+// A runner whose gateway is gone has nobody to report to; the job row is
+// reclaimed by lease expiry. Exiting beats lingering as an orphan.
+exitWithParent(()=>process.exit(0));

@@ -46,3 +46,32 @@ export function spawnDetached(verb: string, options: { log?: number; env?: Recor
 export function sourceTreeAvailable() {
   return !isCompiled && existsSync(sourceCli);
 }
+
+/**
+ * Run `onLost` when the process named by `PGW_PARENT_PID` disappears.
+ *
+ * A GUI shell cannot be relied on to reap what it spawned: Tauri's
+ * `RunEvent::Exit` does not fire when the app is force-quit, SIGKILLed, or
+ * crashes. Without this, the gateway outlives the window that owns it — holding
+ * the port and the `PGW_HOME` ownership lock, so the next launch finds a gateway
+ * it did not start and can never clean up.
+ *
+ * Only used where a parent explicitly claims ownership (the desktop shell sets
+ * the variable). A server started by `pgw open` is *meant* to outlive its CLI
+ * process, so it must not be given a parent to watch.
+ */
+export function exitWithParent(onLost: () => void, parentPid = Number(process.env.PGW_PARENT_PID)) {
+  if (!Number.isInteger(parentPid) || parentPid <= 0) return;
+  const timer = setInterval(() => {
+    try {
+      // Signal 0 only tests for existence.
+      process.kill(parentPid, 0);
+    } catch (error) {
+      // EPERM means it exists but belongs to someone else — still alive.
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") return;
+      clearInterval(timer);
+      onLost();
+    }
+  }, 2000);
+  timer.unref?.();
+}

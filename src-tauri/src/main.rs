@@ -79,7 +79,15 @@ fn main() {
             let child: Option<CommandChild> = if gateway_up(port) {
                 None
             } else {
-                let (mut events, child) = app.shell().sidecar("pgw")?.args(["__serve"]).spawn()?;
+                // PGW_PARENT_PID makes the gateway exit on its own if this process
+                // dies without a clean shutdown — the RunEvent::Exit handler below
+                // only covers a graceful quit, not force-quit or a crash.
+                let (mut events, child) = app
+                    .shell()
+                    .sidecar("pgw")?
+                    .args(["__serve"])
+                    .env("PGW_PARENT_PID", std::process::id().to_string())
+                    .spawn()?;
                 // Drain the sidecar's output; if the pipe fills up it blocks.
                 tauri::async_runtime::spawn(async move {
                     while let Some(event) = events.recv().await {

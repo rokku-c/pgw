@@ -8,6 +8,7 @@ import { stopOwnedRuns } from "./runtime";
 import { startScheduler, stopScheduler } from "./jobs";
 import { closeBudgetStore } from "./budget";
 import { acquireOwnership } from "./ownership";
+import { exitWithParent } from "./self";
 import { checkLocalRequest, ApiError } from "./security";
 import { address, port, adminToken } from "./config";
 
@@ -86,3 +87,7 @@ async function shutdown() {
 }
 process.once("SIGTERM", () => void shutdown());
 process.once("SIGINT", () => void shutdown());
+// When the desktop shell owns this process it sets PGW_PARENT_PID; if that
+// process vanishes without exiting cleanly, shut down rather than linger holding
+// the port and the ownership lock. No-op for a CLI-started server.
+exitWithParent(() => void shutdown());
