@@ -221,3 +221,12 @@ API 和浏览器验证使用独立临时数据目录、本地模拟上游及临�
 - MCP call 增加 sessionKey、native session/turn、run、parent model-call、evidence；独立模型调用、托管运行和 MCP tool call 可出现在同一 session 节点序列，无法确定 parent 时保留无关联，而不是猜测。
 - Model Call 记录首字节、首 Token、生成/decoding 区间；没有真实首 Token 事件时保持 null，不把首字节伪装成首 Token。轨迹节点 Inspector 显示实际采样状态。
 - MCP 通过 `x-pgw-attempt-id` 关联模型调用，原生 Agent 通过 session/turn Header 关联；管理端、console 调用不填充虚假 Agent 身份。
+
+### 自适应上下文、透明重试、协议开关与统计过滤（2026-09-21）
+
+- 增加 `adaptiveContext` 策略：按 provider/model/protocol 学习成功输入下界和 context error 上界；可设置 `maxTokens`、压缩开关、压缩比例（默认 80%）和 awareness prompt。超限时只从可移除的历史消息开始压缩，保留 system/最近消息/工具链；有效请求阶段显示压缩前后的事实。
+- 增加协议转换开关，默认开启；关闭时跨 OpenAI Responses/Chat、Anthropic Messages、Gemini 的路由请求返回明确 `protocol_conversion_disabled`，不会悄悄改变协议。
+- 增加透明重试策略：仅对尚未向客户端输出内容的明确上游状态重试；默认关闭、最多3次、退避、状态白名单可配。每次实际尝试仍独立记录 Traffic，决策中保留 retry 次数；未知结果和已经输出内容不自动重放。
+- Dashboard 增加 model/tool calls、输入/输出/reasoning/cache Token、平均首 Token、平均生成、P95 latency、retry 次数；Trajectory Session 目录支持模型调用数和事件数滑块筛选。
+- `Traffic` 增加 firstTokenMs/decodingMs；首 Token 只从真实可见 delta/工具 delta 采样，缺失保持 null。
+- MCP call 增加 session/native turn/run/parent model-call/evidence 字段，并进入独立/托管 Trajectory；迁移20修复了早期迁移19抢先写版本导致的字段缺失。

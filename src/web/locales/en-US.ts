@@ -1,5 +1,27 @@
 import type zh from "./zh-CN";
 const messages = {
+  "settings.awarenessPrompt": "Context awareness prompt",
+
+  "trajectory.filter.calls": "Model calls",
+  "trajectory.filter.events": "Events",
+
+  "dashboard.modelCalls": "Model calls",
+  "dashboard.toolCalls": "tool calls",
+  "dashboard.latency": "P95 latency",
+  "dashboard.noTiming": "No timing sample",
+  "dashboard.retries": "Retries",
+  "dashboard.reasoning": "reasoning tokens",
+
+  "settings.adaptiveContext": "Adaptive context",
+  "settings.adaptiveContextHint": "Learn context limits from requests and upstream feedback.",
+  "settings.contextCompression": "Compression target",
+  "settings.contextCompressionHint": "When limited, retain roughly this ratio and inject an awareness prompt.",
+  "settings.protocolConversion": "Protocol conversion",
+  "settings.protocolConversionHint": "Allow OpenAI, Anthropic, and Gemini protocol conversion by route.",
+  "settings.transparentRetry": "Transparent retry",
+  "settings.transparentRetryHint": "Retry eligible upstream errors before output reaches the client.",
+  "settings.retryCount": "Max retries",
+
   "traffic.field.firstToken": "First token",
   "traffic.field.decoding": "Decoding",
 

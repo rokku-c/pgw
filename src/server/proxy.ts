@@ -10,6 +10,7 @@ import { StreamConversion } from "./stream-conversion";
 import { EventStreamParser, type ServerEvent } from "./event-stream";
 import { balancedTargets, beginRouteSession, frozenPreferences, pinRoute, recordResponse, releaseRouteSession, unpinRejectedRoute, responseBinding, providerFingerprint, circuitPermit, circuitResult, retryAfter, type FrozenPreference, type RouteSession } from "./routing";
 import { beginCapture, capturePolicy, captureHeaders, captureUrl, type RequestCapture } from "./observability";
+import { applyAdaptiveContext, recordAdaptiveObservation, protocolConversionEnabled, retryPolicy } from "./context-management";
 import type { ClientKey, ModelRoute, Traffic, WireProtocol, Provider, Target } from "../shared/types";
 
 export function extractUsage(body: any) { return mergeUsage(emptyUsage(),body,body?.usageMetadata?"gemini":"responses"); }
@@ -79,6 +80,8 @@ export async function proxy(request:Request):Promise<Response> {
   const protocol:WireProtocol|undefined=gemini?"gemini":({"/v1/responses":"responses","/v1/chat/completions":"chat","/v1/messages":"messages"} as Record<string,WireProtocol>)[path];
   if(!protocol || request.method!=="POST")throw new ApiError(404,"endpoint_not_found");
   const captureConfig=await capturePolicy();
+  const conversionEnabled=await protocolConversionEnabled();
+  const retryConfig=await retryPolicy();
   const original=await readJson(request,16*1024*1024,captureConfig.enabled);
   if(gemini && original && typeof original==="object" && !Array.isArray(original)){ original.model=decodeURIComponent(gemini[1]);original.stream=gemini[2]==="streamGenerateContent"; }
   validate(original,protocol);
@@ -99,13 +102,19 @@ export async function proxy(request:Request):Promise<Response> {
     let lastError:ApiError|undefined;
     if(session?.providerId && !route.targets.some(t=>t.providerId===session.providerId && t.model===session.model))throw new ApiError(409,"pinned_target_removed");
     const targets=session?.providerId?route.targets.filter(t=>t.providerId===session.providerId && t.model===session.model):await balancedTargets(route);
-    for(const target of targets) {
+    const attemptLimit=Math.max(1,targets.length+(retryConfig.enabled?retryConfig.maxRetries:0));
+    for(let targetIndex=0;targetIndex<attemptLimit;targetIndex++) {
+      const target=targets[targetIndex%targets.length];
       const provider=await db.getRepository(ProviderSchema).findOneBy({id:target.providerId,enabled:true});
       if(!provider){ decisions.push({action:"skip",target:target.providerId,reason:"provider_disabled"});continue; }
       const upstreamWire:WireProtocol=target.protocol||(provider.protocol==="anthropic"?"messages":provider.protocol==="gemini"?"gemini":protocol==="responses"?"responses":"chat");
       const converted=upstreamWire!==protocol;
+      if(converted&&!conversionEnabled){lastError=new ApiError(409,"protocol_conversion_disabled");decisions.push({action:"skip",target:provider.id,reason:"protocol_conversion_disabled"});continue;}
+      const managed=await applyAdaptiveContext(body,protocol,route,provider,target.model);
+      if(managed.compressed)decisions.push({action:"context_compress",target:provider.id,reason:`${managed.removed}:${managed.limit}`});
+      const effectiveBody=managed.body;
       let upstreamPayload:any;
-      try{upstreamPayload=converted?convertRequest(body,protocol,upstreamWire,target.model):{...body,model:target.model};}
+      try{upstreamPayload=converted?convertRequest(effectiveBody,protocol,upstreamWire,target.model):{...effectiveBody,model:target.model};}
       catch(error){if(error instanceof ApiError){lastError=error;decisions.push({action:"skip",target:provider.id,reason:error.code});continue;}throw error;}
       if(converted)decisions.push({action:"convert",target:provider.id,reason:`${protocol}→${upstreamWire}:${body.stream?"stream":"json"}`});
       if(session?.providerFingerprint && session.providerFingerprint!==providerFingerprint(provider))throw new ApiError(409,"pinned_provider_changed");
@@ -146,6 +155,7 @@ export async function proxy(request:Request):Promise<Response> {
           await db.getRepository(TrafficSchema).update(traffic.id,{status,error,latencyMs:Date.now()-started,firstByteMs:traffic.firstByteMs,firstTokenMs:traffic.firstTokenMs,decodingMs:traffic.decodingMs,upstreamStatus:traffic.upstreamStatus,inputTokens:traffic.inputTokens,outputTokens:traffic.outputTokens,cacheReadTokens:traffic.cacheReadTokens,cacheWriteTokens:traffic.cacheWriteTokens,cacheWriteLongTokens:traffic.cacheWriteLongTokens,reasoningTokens:traffic.reasoningTokens,costMicros:traffic.costMicros,accounting:traffic.accounting,responseId:traffic.responseId,updatedAt:Date.now()});
           capture.finish(status,error);
           const upstreamFailure=error && error!=="client_cancelled" && ![400,401,403,404,413,422].includes(traffic.upstreamStatus||0)?error:null;
+          await recordAdaptiveObservation(traffic,provider,target.model,protocol,error);
           await circuitResult(circuit.id,status==="completed",upstreamFailure,traffic.upstreamStatus===429?cooldown:null);
         })();
         return finishPromise;
@@ -160,11 +170,11 @@ export async function proxy(request:Request):Promise<Response> {
         if(request.signal.aborted)throw new ApiError(499,"client_cancelled");
         await pinRoute(session,target,provider,prefs,group);
         const payload=upstreamPayload;
-        capture.json("effective",body,requestBodySize(request)+16384);
-        if(converted&&upstreamWire!=="gemini")payload.stream=!!body.stream;
+        capture.json("effective",effectiveBody,requestBodySize(request)+16384);
+        if(converted&&upstreamWire!=="gemini")payload.stream=!!effectiveBody.stream;
         let upstreamPath=upstreamWire==="responses"?"/responses":upstreamWire==="chat"?"/chat/completions":"/messages";
-        if(upstreamWire==="gemini"){delete payload.model;delete payload.stream;upstreamPath=`/models/${encodeURIComponent(target.model)}:${body.stream?"streamGenerateContent?alt=sse":"generateContent"}`;}
-        if(upstreamWire==="chat"&&body.stream)payload.stream_options={...payload.stream_options,include_usage:true};
+        if(upstreamWire==="gemini"){delete payload.model;delete payload.stream;upstreamPath=`/models/${encodeURIComponent(target.model)}:${effectiveBody.stream?"streamGenerateContent?alt=sse":"generateContent"}`;}
+        if(upstreamWire==="chat"&&effectiveBody.stream)payload.stream_options={...payload.stream_options,include_usage:true};
         const headers=upstreamHeaders(provider);
         const beta=request.headers.get("anthropic-beta");if(upstreamWire==="messages"&&beta&&!converted)headers.set("anthropic-beta",beta);
         const reqId=request.headers.get("x-client-request-id");if(reqId&&reqId.length<=200)headers.set("x-client-request-id",reqId);
@@ -177,7 +187,9 @@ export async function proxy(request:Request):Promise<Response> {
           if(response.body){const errorReader=response.body.getReader();const errorChunks:Uint8Array[]=[];let errorSize=0;while(errorSize<1024*1024){const next=await errorReader.read();if(next.done)break;errorSize+=next.value.length;errorChunks.push(next.value);if(errorSize>=1024*1024)break;}capture.chunk("response",Buffer.concat(errorChunks));await errorReader.cancel().catch(()=>{});}
           await finish("failed",`upstream_${response.status}`);
           lastError=new ApiError(response.status===429?429:502,`upstream_${response.status}`);
-          if(response.status===429 && !session?.providerId){decisions.push({action:"fallback",target:provider.id,reason:"explicit_rate_limit_rejection"});continue;}
+          const retryable=retryConfig.enabled&&retryConfig.statuses.includes(response.status)&&targetIndex<attemptLimit-1&&!session?.providerId;
+          if(retryable){decisions.push({action:"retry",target:provider.id,reason:`upstream_${response.status}#${targetIndex+1}`});await Bun.sleep(Math.min(30000,retryConfig.backoffMs*Math.max(1,2**Math.min(targetIndex,8))));continue;}
+          if(response.status===429&&!session?.providerId){decisions.push({action:"fallback",target:provider.id,reason:"explicit_rate_limit_rejection"});continue;}
           throw lastError;
         }
         if(!body.stream){

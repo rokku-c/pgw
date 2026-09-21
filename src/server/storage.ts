@@ -25,7 +25,7 @@ export async function compactStorage(progress: (value: Record<string, unknown>) 
     if (space.bavail * space.bsize < before.bytes * 1.2) throw new Error("Insufficient temporary space for safe SQLite compaction");
     database.run("PRAGMA busy_timeout = 1000");
     const version = (database.query("SELECT max(version) version FROM schema_versions").get() as { version: number }).version;
-    if (version < 12 || version > 20) throw new Error("Start the updated gateway once before compacting");
+    if (version < 12 || version > 21) throw new Error("Start the updated gateway once before compacting");
     database.run("PRAGMA wal_checkpoint(TRUNCATE)");
     database.run("PRAGMA journal_mode = DELETE");
     database.run("PRAGMA locking_mode = EXCLUSIVE");

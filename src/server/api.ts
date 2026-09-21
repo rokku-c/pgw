@@ -14,6 +14,7 @@ import { startRun, stopRun, resumeRun, steerRun, completeRun, decideApproval } f
 import { probeMcp, callMcp, executeMcp, validateGrants, decideMcpCall, cancelMcpCall, publicMcpCall, revokeMcpAccess } from "./mcp";
 import { budgetSummary } from "./budget";
 import { capturePolicy, configureCapture, inspectCapture, captureStage, deleteCapture, deleteAllCaptures, inspectTrajectory, compareTrajectory, trajectorySessions, trajectoryNodes, trajectoryNodeDetail, contextSnapshots, inspectContextSnapshot, compareContextSnapshots, deleteContextSnapshot } from "./observability";
+import { adaptivePolicy, retryPolicy, protocolConversionEnabled } from "./context-management";
 import type { Provider, ClientKey, Dashboard, McpConnection } from "../shared/types";
 
 const name = z.string().trim().min(1).max(100);
@@ -56,12 +57,18 @@ export async function api(request: Request) {
     const [counts] = await db.query(`SELECT count(*) as requests, sum(CASE WHEN status = 'running' THEN 1 ELSE 0 END) as running,
       sum(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
       sum(coalesce(inputTokens, 0) + coalesce(outputTokens, 0)) as tokens,
+      sum(coalesce(inputTokens, 0)) as inputTokens,sum(coalesce(outputTokens, 0)) as outputTokens,sum(coalesce(reasoningTokens, 0)) as reasoningTokens,
+      sum(coalesce(cacheReadTokens, 0)) as cacheReadTokens,sum(coalesce(cacheWriteTokens, 0)) as cacheWriteTokens,
       sum(coalesce(costMicros, 0)) as costMicros, sum(CASE WHEN costMicros IS NULL THEN 1 ELSE 0 END) as unknownCost,
-      avg(CASE WHEN status = 'completed' THEN latencyMs END) as latencyMs FROM traffic WHERE createdAt >= ?`, [since]);
+      avg(CASE WHEN status = 'completed' THEN latencyMs END) as latencyMs,avg(CASE WHEN status='completed' THEN firstTokenMs END) as avgFirstTokenMs,avg(CASE WHEN status='completed' THEN decodingMs END) as avgDecodingMs,
+      sum(CASE WHEN instr(decisions,'"action":"retry"')>0 THEN 1 ELSE 0 END) as retries FROM traffic WHERE createdAt >= ?`, [since]);
+    const latencyRows=await db.query("SELECT latencyMs FROM traffic WHERE createdAt>=? AND status='completed' AND latencyMs IS NOT NULL ORDER BY latencyMs",[since]) as {latencyMs:number}[];
+    const p95LatencyMs=latencyRows.length?latencyRows[Math.min(latencyRows.length-1,Math.floor(latencyRows.length*.95))].latencyMs:null;
+    const [toolCounts]=await db.query("SELECT count(*) n FROM mcp_calls WHERE createdAt>=?",[since]);
     const series = await db.query(`SELECT strftime('%Y-%m-%dT%H:00:00Z', createdAt / 1000, 'unixepoch') as hour, count(*) as count,
       sum(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed FROM traffic WHERE createdAt >= ? GROUP BY hour`, [since]);
     const output: Dashboard = { requests: counts.requests, running: counts.running || 0, successRate: counts.requests ? counts.completed / counts.requests : null,
-      tokens: counts.tokens || 0, costMicros: counts.costMicros || 0, unknownCost: counts.unknownCost || 0, latencyMs: counts.latencyMs,
+      tokens: counts.tokens || 0, inputTokens: counts.inputTokens || 0, outputTokens: counts.outputTokens || 0, reasoningTokens: counts.reasoningTokens || 0, cacheReadTokens: counts.cacheReadTokens || 0, cacheWriteTokens: counts.cacheWriteTokens || 0, costMicros: counts.costMicros || 0, unknownCost: counts.unknownCost || 0, latencyMs: counts.latencyMs, avgFirstTokenMs: counts.avgFirstTokenMs, avgDecodingMs: counts.avgDecodingMs, p95LatencyMs, modelCalls: counts.requests || 0, toolCalls: toolCounts.n || 0, retries: counts.retries || 0,
       series, recent: await db.getRepository(TrafficSchema).find({ order: { createdAt: "DESC" }, take: 8 }),
       events: await db.getRepository(AuditSchema).find({ order: { createdAt: "DESC" }, take: 8 }),
       providers: await db.getRepository(ProviderSchema).countBy({ enabled: true }), agents: await db.getRepository(AssetSchema).countBy({ kind: "agent" }),
@@ -178,7 +185,7 @@ export async function api(request: Request) {
     }
   }
   if(path==="/trajectory/sessions"&&method==="GET"){
-    const input=z.object({kind:z.enum(["scanned","managed","independent"]).optional(),query:z.string().max(300).optional(),cursor:z.string().max(3000).optional(),limit:z.coerce.number().int().min(1).max(100).default(40)}).parse(Object.fromEntries(url.searchParams));
+    const input=z.object({kind:z.enum(["scanned","managed","independent"]).optional(),query:z.string().max(300).optional(),cursor:z.string().max(3000).optional(),limit:z.coerce.number().int().min(1).max(100).default(40),minCalls:z.coerce.number().int().min(0).max(1000000).default(0),maxCalls:z.coerce.number().int().min(0).max(1000000).optional(),minEvents:z.coerce.number().int().min(0).max(1000000).default(0),maxEvents:z.coerce.number().int().min(0).max(1000000).optional()}).parse(Object.fromEntries(url.searchParams));
     return Response.json(await trajectorySessions(input,request.signal));
   }
   const trajectorySession=path.match(/^\/trajectory\/sessions\/([^/]+)\/(nodes|node)$/);
@@ -292,12 +299,15 @@ export async function api(request: Request) {
       return Response.json({ ...result, messages: result.events.filter(e => e.text && ["user", "assistant"].includes(e.role)).map(e => ({ role: e.role, text: e.text })), partial: result.next !== null || result.session.status !== "indexed" });
     }
   }
-  if (path === "/settings" && method === "GET") return Response.json({ personalization: await setting("personalization", true), observability: await capturePolicy() });
+  if (path === "/settings" && method === "GET") return Response.json({ personalization: await setting("personalization", true), observability: await capturePolicy(), adaptiveContext: await adaptivePolicy(), protocolConversion: await protocolConversionEnabled(), transparentRetry: await retryPolicy() });
   if (path === "/settings" && method === "PATCH") {
-    const input = z.object({ personalization: z.boolean().optional(), observability: z.object({ enabled:z.boolean(), retentionDays:z.number().int().min(1).max(365), maxStageBytes:z.number().int().min(65536).max(16*1024*1024), maxStorageBytes:z.number().int().min(1024*1024).max(4*1024*1024*1024) }).optional() }).refine(value => value.personalization !== undefined || value.observability !== undefined).parse(await readJson(request));
+    const input = z.object({ personalization: z.boolean().optional(), observability: z.object({ enabled:z.boolean(), retentionDays:z.number().int().min(1).max(365), maxStageBytes:z.number().int().min(65536).max(16*1024*1024), maxStorageBytes:z.number().int().min(1024*1024).max(4*1024*1024*1024) }).optional(), adaptiveContext: z.object({enabled:z.boolean(),learn:z.boolean(),compressionEnabled:z.boolean(),compressionRatio:z.number().min(.5).max(1),maxTokens:z.number().int().min(256).max(4_000_000).nullable(),awarenessPrompt:z.string().max(4000)}).optional(), protocolConversion:z.boolean().optional(), transparentRetry:z.object({enabled:z.boolean(),maxRetries:z.number().int().min(0).max(100),backoffMs:z.number().int().min(0).max(60000),statuses:z.array(z.number().int().min(400).max(599)).max(30)}).optional() }).refine(value => Object.values(value).some(item => item !== undefined)).parse(await readJson(request));
     if(input.personalization !== undefined) await saveSetting("personalization", input.personalization);
     if(input.observability) await configureCapture(input.observability);
-    await audit("settings.updated", "settings", input); return Response.json({ personalization: await setting("personalization", true), observability: await capturePolicy() });
+    if(input.adaptiveContext) await saveSetting("adaptiveContext", input.adaptiveContext);
+    if(input.protocolConversion !== undefined) await saveSetting("protocolConversion", input.protocolConversion);
+    if(input.transparentRetry) await saveSetting("transparentRetry", input.transparentRetry);
+    await audit("settings.updated", "settings", input); return Response.json({ personalization: await setting("personalization", true), observability: await capturePolicy(), adaptiveContext: await adaptivePolicy(), protocolConversion: await protocolConversionEnabled(), transparentRetry: await retryPolicy() });
   }
   const publicMcp = (item: McpConnection) => { const { envCipher, headersCipher, ...rest } = item; return { ...rest, hasEnv: !!envCipher, hasHeaders: !!headersCipher }; };
   if (path === "/mcp" && method === "GET") return Response.json((await db.getRepository(McpSchema).find({ order: { createdAt: "DESC" } })).map(publicMcp));

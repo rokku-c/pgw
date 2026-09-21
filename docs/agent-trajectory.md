@@ -98,3 +98,9 @@ SQLite 只保存 manifest，正文压缩、加密后写入受控文件目录；�
 MCP Tool Call 是独立节点，只有同一个 session scope 且 `parentCallId` 明确指向模型调用时才建立 `tool_result_of` 关系；名称、时间或参数相似不能替代 call ID。审批是另一个节点，批准不等于执行成功，执行状态和结果分别取实际记录。
 
 性能字段分为 first byte、first token、decoding。first byte 是上游 Response body 首字节；first token 只在协议事件包含可见文本/reasoning/tool delta 时采样；decoding 是完成时刻减去首 token。缺失采样保持 null。不能用总 latency 伪造任一细分时间。
+
+## Adaptive context 与重试
+
+上下文管理是策略而不是事实覆盖：原始 request 永不改写，effective/upstream 阶段保留实际压缩后的请求。学习记录按 Provider/model/protocol 维护成功输入下界、context error 上界和观察次数；不能由单次成功调用声称上游最大窗口。默认压缩比例为 80%，压缩时可注入 awareness prompt 并在路由决策标注删除数量。
+
+协议转换独立开关控制；转换关闭不允许用另一协议伪装成功。透明重试只重试明确状态且尚未产生客户端输出的请求，设置 max retries/backoff/status whitelist；每个 attempt 有独立事实，最终响应对客户端透明但 UI 可见 attempts/retry number。网络提交后结果未知不自动重放。

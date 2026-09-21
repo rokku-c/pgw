@@ -55,7 +55,7 @@ export interface Audit extends RecordBase {
 }
 export interface Dashboard {
   requests: number; running: number; successRate: number | null;
-  tokens: number; costMicros: number; unknownCost: number; latencyMs: number | null;
+  tokens: number; inputTokens: number; outputTokens: number; reasoningTokens: number; cacheReadTokens: number; cacheWriteTokens: number; costMicros: number; unknownCost: number; latencyMs: number | null; avgFirstTokenMs: number | null; avgDecodingMs: number | null; p95LatencyMs: number | null; modelCalls: number; toolCalls: number; retries: number;
   series: { hour: string; count: number; failed: number }[];
   recent: Traffic[]; events: Audit[];
   providers: number; agents: number; skills: number; mcp: number; sessions: number; preferences: number;
@@ -162,6 +162,13 @@ export interface AssetDeployment extends RecordBase {
   beforeHash:string|null; afterHash:string; beforeCipher:string|null; afterCipher:string;
   stagePath:string|null; error:string|null; diff:{path:string;action:"add"|"change"|"remove"}[];
 }
+
+export interface AdaptiveContextPolicy {
+  enabled: boolean; learn: boolean; compressionEnabled: boolean; compressionRatio: number;
+  maxTokens: number | null; awarenessPrompt: string;
+}
+export interface RetryPolicy { enabled: boolean; maxRetries: number; backoffMs: number; statuses: number[] }
+export interface GatewayPolicies { adaptiveContext: AdaptiveContextPolicy; protocolConversion: boolean; transparentRetry: RetryPolicy }
 export interface CapturePolicy { enabled:boolean; revision:number; retentionDays:number; maxStageBytes:number; maxStorageBytes:number }
 export type CaptureStage = "request" | "effective" | "upstream" | "response" | "output";
 export interface CaptureInfo {

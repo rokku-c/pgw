@@ -1,4 +1,26 @@
 export default {
+  "settings.awarenessPrompt": "上下文感知提示",
+
+  "trajectory.filter.calls": "模型调用数",
+  "trajectory.filter.events": "事件数",
+
+  "dashboard.modelCalls": "模型调用",
+  "dashboard.toolCalls": "工具调用",
+  "dashboard.latency": "尾延迟",
+  "dashboard.noTiming": "无采样",
+  "dashboard.retries": "重试",
+  "dashboard.reasoning": "推理 Token",
+
+  "settings.adaptiveContext": "自适应上下文",
+  "settings.adaptiveContextHint": "根据请求和上游反馈学习上下文上限。",
+  "settings.contextCompression": "压缩目标",
+  "settings.contextCompressionHint": "达到上限时保留约此比例，并注入上下文提示。",
+  "settings.protocolConversion": "协议互转",
+  "settings.protocolConversionHint": "允许 OpenAI、Anthropic、Gemini 协议按路由互转。",
+  "settings.transparentRetry": "透明重试",
+  "settings.transparentRetryHint": "仅在尚未向客户端输出内容时重试可重试的上游错误。",
+  "settings.retryCount": "最大重试次数",
+
   "traffic.field.firstToken": "首 Token",
   "traffic.field.decoding": "生成耗时",
 

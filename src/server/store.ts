@@ -30,7 +30,7 @@ export const ClientSchema = schema<ClientKey>("clients", {
 });
 export const TrafficSchema = schema<Traffic>("traffic", {
   clientId: text(), clientName: text(), routeId: text(), model: text(), providerId: text(), providerName: text(),
-  protocol: text(), status: text(), upstreamStatus: integer(true), latencyMs: integer(true), firstByteMs: integer(true),
+  protocol: text(), status: text(), upstreamStatus: integer(true), latencyMs: integer(true), firstByteMs: integer(true), firstTokenMs: integer(true), decodingMs: integer(true),
   inputTokens: integer(true), outputTokens: integer(true), costMicros: integer(true), error: text(true),
   stream: boolean, project: text(true), patchIds: json, requestGroupId: text(true), affinityId: text(true), responseId: text(true), cacheReadTokens: { ...integer(), default: 0 }, cacheWriteTokens: { ...integer(), default: 0 }, cacheWriteLongTokens: { ...integer(), default: 0 }, reasoningTokens: { ...integer(), default: 0 }, decisions: { ...json, default: '[]' }, runId: text(true), accounting: { ...text(), default: "unknown" }, pricing: { ...json, default: '{"input":null,"output":null}' },
 });
@@ -87,7 +87,7 @@ export async function initializeStore() {
       await manager.query('CREATE TABLE IF NOT EXISTS mcp_connections (id TEXT PRIMARY KEY, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, name TEXT NOT NULL, transport TEXT NOT NULL, url TEXT, command TEXT, args TEXT NOT NULL, envCipher TEXT, headersCipher TEXT, enabled BOOLEAN NOT NULL, status TEXT NOT NULL, version TEXT, tools TEXT NOT NULL, capabilities TEXT NOT NULL, schemaHash TEXT, previousSchemaHash TEXT, lastChecked INTEGER, lastError TEXT)');
       await manager.query('INSERT INTO schema_versions(version, appliedAt) VALUES (2, ?)', [Date.now()]);
     });
-  } else if (versions[0].version > 20) throw new Error("Unsupported database schema");
+  } else if (versions[0].version > 21) throw new Error("Unsupported database schema");
   chmodSync(filename, 0o600);
   const [current] = await db.query('SELECT MAX(version) as version FROM schema_versions');
   if (current.version < 3) {
@@ -278,6 +278,11 @@ export async function initializeStore() {
     await manager.query('CREATE INDEX IF NOT EXISTS mcp_calls_session ON mcp_calls(sessionKey,createdAt,id)');
     await manager.query('CREATE INDEX IF NOT EXISTS mcp_calls_run ON mcp_calls(runId,createdAt,id)');
     await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(20,?)',[Date.now()]);
+  });}
+  const [adaptiveVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(adaptiveVersion.version<21){await db.transaction(async manager=>{
+    await manager.query('CREATE TABLE IF NOT EXISTS adaptive_context_limits(providerId TEXT NOT NULL,model TEXT NOT NULL,protocol TEXT NOT NULL,learnedLimit INTEGER,lowerBound INTEGER NOT NULL DEFAULT 0,upperBound INTEGER,observations INTEGER NOT NULL DEFAULT 0,lastError TEXT,updatedAt INTEGER NOT NULL,PRIMARY KEY(providerId,model,protocol))');
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(21,?)',[Date.now()]);
   });}
   await db.query("UPDATE request_captures SET state='partial',reason='gateway_restarted',updatedAt=? WHERE state='recording'",[Date.now()]);
   await db.query("UPDATE asset_deployments SET status='uncertain',error='gateway_restarted',updatedAt=? WHERE status IN ('applying','restoring')",[Date.now()]);

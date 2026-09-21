@@ -28,14 +28,14 @@ function evidence(source: string, scope: string): TrajectoryEvidence {
   return { certainty: source === "legacy_traffic" || source === "request_group" ? "derived" : "explicit", source, scope, confidence: source === "legacy_traffic" ? null : 1 };
 }
 function session(row: any): TrajectorySession { const { scope, evidence: source, ...rest } = row; return { ...rest, evidence: evidence(source, scope) }; }
-export async function trajectorySessions(input: { kind?: string; query?: string; cursor?: string; limit?: number }): Promise<TrajectorySessionPage> {
+export async function trajectorySessions(input: { kind?: string; query?: string; cursor?: string; limit?: number; minCalls?: number; maxCalls?: number; minEvents?: number; maxEvents?: number }): Promise<TrajectorySessionPage> {
   let before: { at: number; key: string } | null = null;
   if (input.cursor) {
     try { before = JSON.parse(Buffer.from(input.cursor, "base64url").toString()); } catch { throw new ApiError(400, "invalid_cursor"); }
     if (!before || !Number.isSafeInteger(before.at) || typeof before.key !== "string" || before.key.length > 400) throw new ApiError(400, "invalid_cursor");
   }
   const limit = input.limit || 40;
-  const rows = sql().query(`${catalog} SELECT * FROM catalog WHERE (?='' OR kind=?) AND (?='' OR instr(lower(coalesce(title,'')||' '||coalesce(project,'')||' '||coalesce(agent,'')||' '||coalesce(nativeId,'')),lower(?))>0) AND (? IS NULL OR at<? OR (at=? AND key>?)) ORDER BY at DESC,key ASC LIMIT ?`).all(input.kind || "", input.kind || "", input.query || "", input.query || "", before?.at ?? null, before?.at ?? null, before?.at ?? null, before?.key ?? "", limit + 1) as any[];
+  const rows = sql().query(`${catalog} SELECT * FROM catalog WHERE (?='' OR kind=?) AND (?='' OR instr(lower(coalesce(title,'')||' '||coalesce(project,'')||' '||coalesce(agent,'')||' '||coalesce(nativeId,'')),lower(?))>0) AND calls>=? AND (? IS NULL OR calls<=?) AND events>=? AND (? IS NULL OR events<=?) AND (? IS NULL OR at<? OR (at=? AND key>?)) ORDER BY at DESC,key ASC LIMIT ?`).all(input.kind || "", input.kind || "", input.query || "", input.query || "", input.minCalls || 0, input.maxCalls ?? null, input.maxCalls ?? null, input.minEvents || 0, input.maxEvents ?? null, input.maxEvents ?? null, before?.at ?? null, before?.at ?? null, before?.at ?? null, before?.key ?? "", limit + 1) as any[];
   const more = rows.length > limit; if (more) rows.pop();
   const last = rows.at(-1);
   return { items: rows.map(session), next: more ? Buffer.from(JSON.stringify({ at: last.at, key: last.key })).toString("base64url") : null };
