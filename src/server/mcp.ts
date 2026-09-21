@@ -9,7 +9,7 @@ import { atomic } from "./transactions";
 import { version, home } from "./config";
 import type { McpConnection, McpGrant, McpCall, ClientKey, PublicMcpCall } from "../shared/types";
 
-type Principal = { id: string | null; name: string; project: string | null };
+type Principal = { id: string | null; name: string; project: string | null; sessionKey?: string | null; nativeSessionId?: string | null; nativeTurnId?: string | null; runId?: string | null; parentCallId?: string | null; evidence?: string | null };
 const validators = new AjvJsonSchemaValidator();
 const active = new Map<string, AbortController>();
 const probeLocks = new Set<string>();
@@ -129,13 +129,13 @@ const sleeping = (signal: AbortSignal) => new Promise<void>((resolve, reject) =>
 export async function executeMcp(config: McpConnection, kind: McpCall["kind"], name: string, args: Record<string, unknown>, principal: Principal, requestSignal: AbortSignal, confirmed = false): Promise<any> {
   validateInput(config, kind, name, args);
   const grant = await currentGrant(principal, config, kind, name);
-  const call: McpCall = { ...record(), connectionId: config.id, connectionName: config.name, clientId: principal.id, clientName: principal.name, project: principal.project, kind, name, schemaHash: config.schemaHash!, requestCipher: encrypt(JSON.stringify(args)), status: grant.requireApproval && !confirmed ? "pending" : "approved", resultCipher: null, error: null, expiresAt: Date.now() + 120000, startedAt: null, endedAt: null };
+  const call: McpCall = { ...record(), connectionId: config.id, connectionName: config.name, clientId: principal.id, clientName: principal.name, project: principal.project, kind, name, schemaHash: config.schemaHash!, requestCipher: encrypt(JSON.stringify(args)), sessionKey: principal.sessionKey || null, nativeSessionId: principal.nativeSessionId || null, nativeTurnId: principal.nativeTurnId || null, runId: principal.runId || null, parentCallId: principal.parentCallId || null, evidence: principal.evidence || null, status: grant.requireApproval && !confirmed ? "pending" : "approved", resultCipher: null, error: null, expiresAt: Date.now() + 120000, startedAt: null, endedAt: null };
   await atomic(database => {
     const count = database.query("SELECT count(*) n FROM mcp_calls WHERE status IN ('pending','approved','running')").get() as { n: number };
     const personal = principal.id ? database.query("SELECT count(*) n FROM mcp_calls WHERE clientId=? AND status IN ('pending','approved','running')").get(principal.id) as { n: number } : count;
     if (count.n >= 32 || principal.id && personal.n >= 4) throw new ApiError(429, "mcp_concurrency_limit");
-    database.query('INSERT INTO mcp_calls(id,createdAt,updatedAt,connectionId,connectionName,clientId,clientName,project,kind,name,schemaHash,requestCipher,status,resultCipher,error,expiresAt,startedAt,endedAt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,NULL,NULL)')
-      .run(call.id, call.createdAt, call.updatedAt, call.connectionId, call.connectionName, call.clientId, call.clientName, call.project, call.kind, call.name, call.schemaHash, call.requestCipher, call.status, call.expiresAt);
+    database.query('INSERT INTO mcp_calls(id,createdAt,updatedAt,connectionId,connectionName,clientId,clientName,project,kind,name,schemaHash,requestCipher,sessionKey,nativeSessionId,nativeTurnId,runId,parentCallId,evidence,status,resultCipher,error,expiresAt,startedAt,endedAt) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,NULL,NULL)')
+      .run(call.id, call.createdAt, call.updatedAt, call.connectionId, call.connectionName, call.clientId, call.clientName, call.project, call.kind, call.name, call.schemaHash, call.requestCipher, call.sessionKey, call.nativeSessionId, call.nativeTurnId, call.runId, call.parentCallId, call.evidence, call.status, call.expiresAt);
   });
   const controller = new AbortController();
   active.set(call.id, controller);
@@ -208,7 +208,11 @@ async function authenticatedClient(request: Request) {
 }
 export async function handleMcp(request: Request) {
   const client = await authenticatedClient(request);
-  const principal: Principal = client ? { id: client.id, name: client.name, project: client.project } : { id: null, name: "Admin MCP", project: null };
+  const nativeSessionId=request.headers.get("x-claude-code-session-id")||request.headers.get("x-codex-session-id")||request.headers.get("x-session-id");
+  const nativeTurnId=request.headers.get("x-pgw-turn-id")||request.headers.get("x-codex-turn-id");
+  const rawSession=request.headers.get("x-pgw-session")||nativeSessionId;
+  const sessionKey=rawSession?`external:${hash(`${client?.id||"admin"}:${rawSession}:${client?.project||""}`)}`:null;
+  const principal: Principal = client ? { id: client.id, name: client.name, project: client.project, sessionKey, nativeSessionId, nativeTurnId, runId: client.runId, parentCallId: request.headers.get("x-pgw-attempt-id"), evidence: request.headers.get("x-pgw-attempt-id") ? "model_call_header" : nativeSessionId ? "native_session_header" : null } : { id: null, name: "Admin MCP", project: null, sessionKey, nativeSessionId, nativeTurnId, parentCallId: request.headers.get("x-pgw-attempt-id"), evidence: "admin_request" };
   const server = new McpServer({ name: "personal-gateway", version }, { capabilities: { tools: {}, resources: {}, prompts: {} } });
   const exposed = { tools: !client || client.memoryAccess ? 3 : 0, resources: 0, prompts: 0 };
   const reauthorize = async () => { const next = await authenticatedClient(request); if (client && next?.id !== client.id) throw new ApiError(403, "mcp_scope_denied"); return next; };

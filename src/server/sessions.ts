@@ -8,6 +8,7 @@ import { atomic } from "./transactions";
 import { ApiError, hash } from "./security";
 import { home } from "./config";
 import type { WorkContext } from "./job-context";
+import { readSessionEvents, matchingOffsets } from "./session-files";
 import { parserVersion, parseSessionLine } from "./session-parser";
 import { purgeSessionEvidence, learnFromEvent } from "./preferences";
 import type { CollectionSource, Session, SessionEvent, SessionList, SessionTimeline } from "../shared/types";
@@ -70,8 +71,7 @@ export async function saveSource(input: Pick<CollectionSource, "name" | "agent" 
       }
     }
     if (previous && input.learn && !previous.learn && !reset) {
-      const events = database.query("SELECT e.*,s.project FROM session_events e JOIN sessions s ON s.id=e.sessionId WHERE s.sourceId=? AND e.origin='user' AND e.kind='message' AND e.text IS NOT NULL").iterate(id!);
-      for (const row of events) { const event = row as SessionEvent & { project: string | null }; learnFromEvent(database, event, id!, event.project); }
+      database.query("UPDATE sessions SET parserVersion=0 WHERE sourceId=?").run(id!);
     }
     database.query(`INSERT INTO collection_sources(id,createdAt,updatedAt,name,agent,path,enabled,captureBodies,learn,revision,lastScanAt,lastError,fileCount,state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET updatedAt=excluded.updatedAt,name=excluded.name,agent=excluded.agent,path=excluded.path,enabled=excluded.enabled,captureBodies=excluded.captureBodies,learn=excluded.learn,revision=excluded.revision,lastError=NULL,state='idle'`)
       .run(source.id, source.createdAt, source.updatedAt, source.name, source.agent, source.path, source.enabled ? 1 : 0, source.captureBodies ? 1 : 0, source.learn ? 1 : 0, source.revision, source.lastScanAt, null, source.fileCount, "idle");
@@ -148,12 +148,12 @@ async function indexFile(path: string, source: CollectionSource): Promise<number
         if (database.query('SELECT path FROM session_tombstones WHERE sourceId=? AND path=?').get(source.id, canonical)) throw new ApiError(409, "collection_cancelled");
         const insert = database.query('INSERT OR IGNORE INTO session_events(id,createdAt,updatedAt,sessionId,generation,sourceKey,nativeId,parentId,kind,role,origin,text,metadata,offset,endOffset,timestamp) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
         for (const event of queued) {
-          const value = insert.run(event.id,event.createdAt,event.updatedAt,event.sessionId,event.generation,event.sourceKey,event.nativeId,event.parentId,event.kind,event.role,event.origin,event.text,JSON.stringify(event.metadata),event.offset,event.endOffset,event.timestamp);
+          const value = insert.run(event.id,event.createdAt,event.updatedAt,event.sessionId,event.generation,event.sourceKey,event.nativeId,event.parentId,event.kind,event.role,event.origin,null,JSON.stringify(event.metadata),event.offset,event.endOffset,event.timestamp);
+          if (source.learn) learnFromEvent(database, event, source.id, session.project);
           if (!value.changes) continue;
           session.eventCount++; parsed++;
           if (event.kind === "message" && ["user", "assistant"].includes(event.role)) session.messageCount++;
           if (event.kind === "parse_error") session.parseErrors++;
-          if (source.learn) learnFromEvent(database, event, source.id, session.project);
         }
         putSession(database, session);
       });
@@ -268,7 +268,7 @@ export function startCollection() {
   timer.unref();
 }
 export async function stopCollection() { stopping = true; clearInterval(timer); await scanning; }
-export async function listSessions(input: { query?: string; agent?: string; project?: string; sourceId?: string; archived?: boolean; starred?: boolean; offset?: number; limit?: number }): Promise<SessionList> {
+export async function listSessions(input: { query?: string; agent?: string; project?: string; sourceId?: string; archived?: boolean; starred?: boolean; offset?: number; limit?: number }, context?: WorkContext): Promise<SessionList> {
   const offset = input.offset || 0, limit = Math.min(input.limit || 50, 200);
   const query = db.getRepository(SessionSchema).createQueryBuilder("s");
   if (input.archived !== undefined) query.andWhere('s.archived = :archived', { archived: input.archived });
@@ -276,20 +276,43 @@ export async function listSessions(input: { query?: string; agent?: string; proj
   if (input.agent) query.andWhere('s.agent = :agent', { agent: input.agent });
   if (input.project) query.andWhere('s.project = :project', { project: input.project });
   if (input.sourceId) query.andWhere('s.sourceId = :sourceId', { sourceId: input.sourceId });
-  if (input.query) {
-    const text = input.query;
-    const search = [...text].length >= 3 ? 'SELECT sessionId FROM session_search WHERE session_search MATCH :match' : 'SELECT sessionId FROM session_events WHERE instr(lower(text),lower(:text)) > 0';
-    query.andWhere(`(instr(lower(s.title),lower(:text)) > 0 OR instr(lower(coalesce(s.project,'')),lower(:text)) > 0 OR s.id IN (${search}))`, { text, match: `"${text.replaceAll('"', '""')}"` });
+  query.orderBy('s.starred', 'DESC').addOrderBy('s.lastActiveAt', 'DESC').addOrderBy('s.id', 'ASC');
+  if (!input.query) {
+    const [items, total] = await query.skip(offset).take(limit).getManyAndCount();
+    return { items, total, next: offset + items.length < total ? offset + items.length : null };
   }
-  const [items, total] = await query.orderBy('s.starred', 'DESC').addOrderBy('s.lastActiveAt', 'DESC').skip(offset).take(limit).getManyAndCount();
-  return { items, total, next: offset + items.length < total ? offset + items.length : null };
+  const sources = new Map((await db.getRepository(SourceSchema).find()).map(source => [source.id, source]));
+  const items: Session[] = [], needle = input.query.toLowerCase();
+  let total = 0, unavailable = 0, scanned = 0;
+  const candidates = await query.getCount();
+  for (let start = 0; start < candidates; start += 100) {
+    const batch = await query.clone().skip(start).take(100).getMany();
+    for (const session of batch) {
+      await context?.check();
+      let matches = session.title.toLowerCase().includes(needle) || !!session.project?.toLowerCase().includes(needle);
+      const source = session.sourceId ? sources.get(session.sourceId) : undefined;
+      if (!matches && source?.enabled && source.captureBodies) {
+        try { matches = (await matchingOffsets(session, source, input.query, context ? { ...context, progress: async () => { await context.progress("search", scanned, candidates, session.path); } } : undefined, true)).length > 0; }
+        catch (error) { if (error instanceof ApiError && error.code === "job_cancelled") throw error; unavailable++; }
+      }
+      if (matches) { if (total >= offset && items.length < limit) items.push(session); total++; }
+      scanned++; await context?.progress("search", scanned, candidates, session.path);
+    }
+  }
+  for (const source of sources.values()) {
+    const current = await db.getRepository(SourceSchema).findOneBy({ id: source.id });
+    if (!current || current.revision !== source.revision) throw new ApiError(409, "source_changed");
+  }
+  return { items, total, next: offset + items.length < total ? offset + items.length : null, unavailable };
 }
-export async function timeline(id: string, options: { after?: number; limit?: number; query?: string; leaf?: string } = {}): Promise<SessionTimeline> {
+
+export async function timeline(id: string, options: { after?: number; limit?: number; query?: string; leaf?: string } = {}, context?: WorkContext, includeBodies = true): Promise<SessionTimeline> {
   const session = await db.getRepository(SessionSchema).findOneBy({ id });
   if (!session) throw new ApiError(404, "session_not_found");
   const source = session.sourceId ? await db.getRepository(SourceSchema).findOneBy({ id: session.sourceId }) : null;
   const query = db.getRepository(SessionEventSchema).createQueryBuilder('e').where('e.sessionId=:id', { id });
-  if (options.query) query.andWhere('instr(lower(e.text),lower(:text)) > 0', { text: options.query });
+  let offsets: Set<number> | undefined;
+  if (options.query) offsets = new Set(source?.enabled && source.captureBodies ? await matchingOffsets(session, source, options.query, context) : []);
   if (options.leaf) {
     const lineage = await db.query(`WITH RECURSIVE ancestors(nativeId,parentId) AS (SELECT nativeId,parentId FROM session_events WHERE sessionId=? AND nativeId=? UNION SELECT e.nativeId,e.parentId FROM session_events e JOIN ancestors a ON e.nativeId=a.parentId WHERE e.sessionId=?) SELECT DISTINCT nativeId FROM ancestors LIMIT 10001`, [id, options.leaf, id]);
     const ids = lineage.map((e: { nativeId: string }) => e.nativeId);
@@ -297,12 +320,24 @@ export async function timeline(id: string, options: { after?: number; limit?: nu
     if (ids.length > 10000) throw new ApiError(413, "branch_too_large");
     query.andWhere('e.nativeId IN (:...ids)', { ids });
   }
-  const total = await query.getCount();
-  if (options.after !== undefined) query.andWhere('e.offset > :after', { after: options.after });
   const limit = options.limit || 100;
-  const events = await query.orderBy('e.offset', 'ASC').take(limit + 1).getMany();
-  const more = events.length > limit; if (more) events.pop();
-  if (!source?.captureBodies) for (const event of events) event.text = null;
+  let total: number, events: SessionEvent[], more: boolean;
+  if (offsets) {
+    const pointers = await query.clone().select(["e.id", "e.offset"]).orderBy('e.offset', 'ASC').getMany();
+    const matches = pointers.filter(event => offsets.has(event.offset));
+    total = matches.length;
+    const page = matches.filter(event => options.after === undefined || event.offset > options.after).slice(0, limit + 1);
+    more = page.length > limit; if (more) page.pop();
+    events = page.length ? await query.andWhere('e.id IN (:...ids)', { ids: page.map(event => event.id) }).orderBy('e.offset', 'ASC').getMany() : [];
+  } else {
+    total = await query.getCount();
+    if (options.after !== undefined) query.andWhere('e.offset > :after', { after: options.after });
+    events = await query.orderBy('e.offset', 'ASC').take(limit + 1).getMany();
+    more = events.length > limit; if (more) events.pop();
+  }
+  events = includeBodies ? await readSessionEvents(session, source, events, context) : events.map(event => ({ ...event, text: null }));
+  const current = source ? await db.getRepository(SourceSchema).findOneBy({ id: source.id }) : null;
+  if (source && (!current || current.revision !== source.revision)) throw new ApiError(409, "source_changed");
   const branches = await db.query(`SELECT e.nativeId id,count(*) count FROM session_events e WHERE e.sessionId=? AND e.nativeId IS NOT NULL AND NOT EXISTS(SELECT 1 FROM session_events c WHERE c.sessionId=e.sessionId AND c.parentId=e.nativeId) GROUP BY e.nativeId LIMIT 200`, [id]);
   return { session, events, total, next: more ? events.at(-1)!.offset : null, branches };
 }

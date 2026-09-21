@@ -1,6 +1,6 @@
 export type Protocol = "openai" | "anthropic" | "gemini";
 export type WireProtocol = "responses" | "chat" | "messages" | "gemini";
-export type Page = "overview" | "models" | "traffic" | "sessions" | "registry" | "persona" | "runs" | "settings" | "jobs" | "playground";
+export type Page = "overview" | "observability" | "models" | "traffic" | "sessions" | "registry" | "persona" | "runs" | "settings" | "jobs" | "playground";
 export interface RecordBase { id: string; createdAt: number; updatedAt: number }
 export interface Provider extends RecordBase {
   name: string; protocol: Protocol; baseUrl: string; secretCipher: string | null;
@@ -14,7 +14,7 @@ export interface ModelRoute extends RecordBase {
   inputPrice: number | null; outputPrice: number | null; cacheReadPrice: number | null; cacheWritePrice: number | null; cacheWriteLongPrice: number | null; contextLimit: number; outputLimit: number;
 }
 export interface ClientKey extends RecordBase {
-  name: string; keyHash: string; keyPreview: string; enabled: boolean;
+  name: string; kind: "long_term" | "temporary"; keyHash: string; keyPreview: string; enabled: boolean;
   project: string | null; personalize: boolean; routeIds: string[]; lastUsedAt: number | null;
   budgetMicros: number | null; tokenLimit: number | null; maxConcurrent: number; runId: string | null; expiresAt: number | null;
   mcpGrants: McpGrant[]; memoryAccess: boolean;
@@ -24,7 +24,7 @@ export interface Traffic extends RecordBase {
   clientId: string; clientName: string; routeId: string; model: string;
   providerId: string; providerName: string; protocol: WireProtocol;
   status: "running" | "completed" | "failed" | "cancelled";
-  upstreamStatus: number | null; latencyMs: number | null; firstByteMs: number | null;
+  upstreamStatus: number | null; latencyMs: number | null; firstByteMs: number | null; firstTokenMs: number | null; decodingMs: number | null;
   inputTokens: number | null; outputTokens: number | null; costMicros: number | null;
   error: string | null; stream: boolean; project: string | null; patchIds: string[];
   runId: string | null; accounting: "pending" | "reported" | "estimated" | "unknown" | "rejected"; pricing: { input: number | null; output: number | null; cacheRead?: number | null; cacheWrite?: number | null; cacheWriteLong?: number | null };
@@ -122,7 +122,7 @@ export interface PreferenceEvidence extends RecordBase {
   preferenceId: string; eventId: string | null; sourceId: string | null; sessionId: string | null;
   excerpt: string; kind: "explicit" | "inferred" | "correction" | "counterexample"; confidence: number;
 }
-export interface SessionList { items: Session[]; total: number; next: number | null }
+export interface SessionList { unavailable?: number; items: Session[]; total: number; next: number | null }
 export interface SessionTimeline { session: Session; events: SessionEvent[]; total: number; next: number | null; branches: { id: string; count: number }[] }
 export interface McpGrant {
   connectionId: string; schemaHash: string; tools: string[]; resources: string[]; prompts: string[]; requireApproval: boolean;
@@ -130,6 +130,7 @@ export interface McpGrant {
 export interface McpCall extends RecordBase {
   connectionId: string; connectionName: string; clientId: string | null; clientName: string; project: string | null;
   kind: "tool" | "resource" | "prompt"; name: string; schemaHash: string; requestCipher: string;
+  sessionKey: string | null; nativeSessionId: string | null; nativeTurnId: string | null; runId: string | null; parentCallId: string | null; evidence: string | null;
   status: "pending" | "approved" | "running" | "completed" | "rejected" | "cancelled" | "failed" | "uncertain";
   resultCipher: string | null; error: string | null; expiresAt: number; startedAt: number | null; endedAt: number | null;
 }
@@ -138,7 +139,7 @@ export interface McpCatalogRevision extends RecordBase {
   connectionId: string; hash: string; version: string | null;
   catalog: Pick<McpConnection, "tools" | "resources" | "prompts">;
 }
-export type JobKind = "registry.scan" | "sessions.scan" | "sessions.search" | "provider.probe" | "mcp.probe" | "model.debug" | "mcp.debug";
+export type JobKind = "trajectory.snapshot" | "trajectory.cleanup" | "registry.scan" | "sessions.scan" | "sessions.search" | "sessions.timeline" | "provider.probe" | "mcp.probe" | "model.debug" | "mcp.debug" | "assets.scan" | "assets.search" | "assets.inspect" | "assets.snapshot" | "assets.preview" | "assets.apply" | "assets.restore";
 export interface BackgroundJob extends RecordBase {
   kind: JobKind; label: string; status: "queued" | "running" | "waiting" | "completed" | "failed" | "cancelled" | "uncertain";
   payloadCipher: string; resultCipher: string | null; dedupKey: string | null;
@@ -147,3 +148,29 @@ export interface BackgroundJob extends RecordBase {
   cancelRequested: boolean; error: string | null;
 }
 export type PublicJob = Omit<BackgroundJob, "payloadCipher" | "resultCipher" | "dedupKey">;
+export interface AssetRoot extends RecordBase {
+  name:string; path:string; agent:"claude"|"codex"|"pi"|"shared"; project:string|null;
+  enabled:boolean; followSymlinks:boolean; capture:boolean; revision:number;
+  lastScanAt:number|null; lastError:string|null; count:number;
+}
+export interface PackageFile { path:string; hash:string; size:number; executable:boolean; mode?:number; content:string }
+export interface SkillPackage { files:PackageFile[]; hash:string; bytes:number; directories?:{path:string;mode:number}[] }
+export interface AssetSnapshot extends RecordBase { assetId:string; hash:string; bytes:number; files:{path:string;hash:string;size:number;executable:boolean}[]; contentCipher:string; version:string|null }
+export interface AssetDeployment extends RecordBase {
+  assetId:string; snapshotId:string; target:string; targetRoot:string; agent:string;
+  status:"prepared"|"applying"|"applied"|"restoring"|"restored"|"failed"|"uncertain";
+  beforeHash:string|null; afterHash:string; beforeCipher:string|null; afterCipher:string;
+  stagePath:string|null; error:string|null; diff:{path:string;action:"add"|"change"|"remove"}[];
+}
+export interface CapturePolicy { enabled:boolean; revision:number; retentionDays:number; maxStageBytes:number; maxStorageBytes:number }
+export type CaptureStage = "request" | "effective" | "upstream" | "response" | "output";
+export interface CaptureInfo {
+  requestId:string; requestGroupId:string; state:"recording"|"complete"|"partial"|"expired"|"deleted"|"not_captured";
+  createdAt:number; updatedAt:number; expiresAt:number; bytes:number; reason:string|null;
+  metadata:Record<string,unknown>; stages:{stage:CaptureStage;bytes:number;chunks:number}[];
+}
+export interface CapturePage { text:string; next:number|null; bytes:number; complete:boolean; fallback?:boolean }
+
+export interface ObservabilityEvent { id:string; at:number; kind:"session"|"model_call"|"managed_session"|"tool_call"|"job"|"scan"; title:string; status:string; sessionId:string|null; runId:string|null; trafficId:string|null; details:Record<string,unknown> }
+export interface ObservabilitySnapshot { id:string; createdAt:number; updatedAt:number; label:string; hash:string; summary:{sessions:number;modelCalls:number;managedSessions:number;tools:number;jobs:number}; }
+export interface SnapshotDiffItem { path:string; action:"add"|"remove"|"change"; before?:unknown; after?:unknown }

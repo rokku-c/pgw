@@ -9,7 +9,8 @@ import { startScheduler, stopScheduler } from "./jobs";
 import { closeBudgetStore } from "./budget";
 import { acquireOwnership } from "./ownership";
 import { checkLocalRequest, ApiError } from "./security";
-import { address, port, adminToken } from "./config";
+import { address, port, adminToken, writeDevAccessFile } from "./config";
+import { closeCaptures } from "./observability";
 
 let ready = false;
 
@@ -48,6 +49,8 @@ let releaseOwnership: (() => void) | undefined;
 try {
   releaseOwnership = acquireOwnership();
   await initializeStore();
+  const accessFile = writeDevAccessFile();
+  if (accessFile) console.log(`  Development access: ${accessFile}`);
   await audit("gateway.started", "local");
   startScheduler();
   ready = true;
@@ -69,6 +72,7 @@ async function shutdown() {
   await stopOwnedRuns();
   await audit("gateway.stopped", "local");
   closeBudgetStore();
+  await closeCaptures();
   await db.destroy();
   releaseOwnership?.();
   process.exit(0);

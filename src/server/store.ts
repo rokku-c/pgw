@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { chmodSync } from "node:fs";
 import { home } from "./config";
 import { BunSqlite } from "./sqlite";
-import type { Provider, ModelRoute, ClientKey, Traffic, Preference, Asset, Session, Audit, RecordBase, Run, McpConnection, RunEvent, RunApproval, CollectionSource, SessionEvent, PreferenceRevision, PreferenceEvidence, McpCall, McpCatalogRevision, BackgroundJob } from "../shared/types";
+import type { Provider, ModelRoute, ClientKey, Traffic, Preference, Asset, Session, Audit, RecordBase, Run, McpConnection, RunEvent, RunApproval, CollectionSource, SessionEvent, PreferenceRevision, PreferenceEvidence, McpCall, McpCatalogRevision, BackgroundJob, AssetRoot, AssetSnapshot, AssetDeployment } from "../shared/types";
 
 const text = (nullable = false): EntitySchemaColumnOptions => ({ type: "text", nullable });
 const integer = (nullable = false): EntitySchemaColumnOptions => ({ type: "integer", nullable });
@@ -24,7 +24,7 @@ export const RouteSchema = schema<ModelRoute>("routes", {
   contextLimit: integer(), outputLimit: integer(), cacheReadPrice: { type: "real", nullable: true }, cacheWritePrice: { type: "real", nullable: true }, cacheWriteLongPrice: { type: "real", nullable: true },
 });
 export const ClientSchema = schema<ClientKey>("clients", {
-  name: text(), keyHash: { ...text(), unique: true }, keyPreview: text(), enabled: boolean,
+  name: text(), kind: { ...text(), default: "long_term" }, keyHash: { ...text(), unique: true }, keyPreview: text(), enabled: boolean,
   project: text(true), personalize: boolean, routeIds: json, lastUsedAt: integer(true),
   budgetMicros: integer(true), tokenLimit: integer(true), maxConcurrent: { ...integer(), default: 4 }, runId: text(true), expiresAt: integer(true), mcpGrants: { ...json, default: '[]' }, memoryAccess: { ...boolean, default: false },
 });
@@ -56,10 +56,13 @@ export const SourceSchema = schema<CollectionSource>("collection_sources", { nam
 export const SessionEventSchema = schema<SessionEvent>("session_events", { sessionId: text(), generation: integer(), sourceKey: text(), nativeId: text(true), parentId: text(true), kind: text(), role: text(), origin: text(), text: text(true), metadata: json, offset: integer(), endOffset: integer(), timestamp: integer(true) });
 export const PreferenceRevisionSchema = schema<PreferenceRevision>("preference_revisions", { preferenceId: text(), revision: integer(), title: text(), content: text(), scope: text(), project: text(true), status: text(), reason: text() });
 export const EvidenceSchema = schema<PreferenceEvidence>("preference_evidence", { preferenceId: text(), eventId: text(true), sourceId: text(true), sessionId: text(true), excerpt: text(), kind: text(), confidence: { type: "real" } });
-export const McpCallSchema = schema<McpCall>("mcp_calls", { connectionId: text(), connectionName: text(), clientId: text(true), clientName: text(), project: text(true), kind: text(), name: text(), schemaHash: text(), requestCipher: text(), status: text(), resultCipher: text(true), error: text(true), expiresAt: integer(), startedAt: integer(true), endedAt: integer(true) });
+export const McpCallSchema = schema<McpCall>("mcp_calls", { connectionId: text(), connectionName: text(), clientId: text(true), clientName: text(), project: text(true), kind: text(), name: text(), schemaHash: text(), requestCipher: text(), sessionKey: text(true), nativeSessionId: text(true), nativeTurnId: text(true), runId: text(true), parentCallId: text(true), evidence: text(true), status: text(), resultCipher: text(true), error: text(true), expiresAt: integer(), startedAt: integer(true), endedAt: integer(true) });
 export const McpRevisionSchema = schema<McpCatalogRevision>("mcp_revisions", { connectionId: text(), hash: text(), version: text(true), catalog: json });
 export const JobSchema = schema<BackgroundJob>("background_jobs", { kind:text(),label:text(),status:text(),payloadCipher:text(),resultCipher:text(true),dedupKey:text(true),phase:text(),processed:integer(),total:integer(true),currentItem:text(true),attempts:integer(),nextRunAt:integer(),startedAt:integer(true),endedAt:integer(true),heartbeatAt:integer(true),cancelRequested:boolean,error:text(true) });
-const entities = [JobSchema, McpCallSchema, McpRevisionSchema, SourceSchema, SessionEventSchema, PreferenceRevisionSchema, EvidenceSchema, RunEventSchema, ApprovalSchema, McpSchema, RunSchema, ProviderSchema, RouteSchema, ClientSchema, TrafficSchema, PreferenceSchema, AssetSchema, SessionSchema, AuditSchema, SettingSchema];
+export const AssetRootSchema=schema<AssetRoot>("asset_roots",{name:text(),path:{...text(),unique:true},agent:text(),project:text(true),enabled:boolean,followSymlinks:boolean,capture:boolean,revision:integer(),lastScanAt:integer(true),lastError:text(true),count:integer()});
+export const SnapshotSchema=schema<AssetSnapshot>("asset_snapshots",{assetId:text(),hash:text(),bytes:integer(),files:json,contentCipher:text(),version:text(true)});
+export const DeploymentSchema=schema<AssetDeployment>("asset_deployments",{assetId:text(),snapshotId:text(),target:text(),targetRoot:text(),agent:text(),status:text(),beforeHash:text(true),afterHash:text(),beforeCipher:text(true),afterCipher:text(),stagePath:text(true),error:text(true),diff:json});
+const entities = [AssetRootSchema,SnapshotSchema,DeploymentSchema, JobSchema, McpCallSchema, McpRevisionSchema, SourceSchema, SessionEventSchema, PreferenceRevisionSchema, EvidenceSchema, RunEventSchema, ApprovalSchema, McpSchema, RunSchema, ProviderSchema, RouteSchema, ClientSchema, TrafficSchema, PreferenceSchema, AssetSchema, SessionSchema, AuditSchema, SettingSchema];
 const filename = join(home, "gateway.sqlite");
 export const db = new DataSource({
   type: "better-sqlite3", driver: BunSqlite, database: filename, entities, synchronize: false,
@@ -84,7 +87,7 @@ export async function initializeStore() {
       await manager.query('CREATE TABLE IF NOT EXISTS mcp_connections (id TEXT PRIMARY KEY, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, name TEXT NOT NULL, transport TEXT NOT NULL, url TEXT, command TEXT, args TEXT NOT NULL, envCipher TEXT, headersCipher TEXT, enabled BOOLEAN NOT NULL, status TEXT NOT NULL, version TEXT, tools TEXT NOT NULL, capabilities TEXT NOT NULL, schemaHash TEXT, previousSchemaHash TEXT, lastChecked INTEGER, lastError TEXT)');
       await manager.query('INSERT INTO schema_versions(version, appliedAt) VALUES (2, ?)', [Date.now()]);
     });
-  } else if (versions[0].version > 10) throw new Error("Unsupported database schema");
+  } else if (versions[0].version > 20) throw new Error("Unsupported database schema");
   chmodSync(filename, 0o600);
   const [current] = await db.query('SELECT MAX(version) as version FROM schema_versions');
   if (current.version < 3) {
@@ -200,8 +203,86 @@ export async function initializeStore() {
     await manager.query('CREATE INDEX IF NOT EXISTS debug_attempts_job ON debug_attempts(jobId,number)');
     await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(10,?)',[Date.now()]);
   });}
+  const [assetVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(assetVersion.version<11){await db.transaction(async manager=>{
+    await manager.query('CREATE TABLE IF NOT EXISTS asset_roots(id TEXT PRIMARY KEY,createdAt INTEGER NOT NULL,updatedAt INTEGER NOT NULL,name TEXT NOT NULL,path TEXT NOT NULL UNIQUE,agent TEXT NOT NULL,project TEXT,enabled BOOLEAN NOT NULL,followSymlinks BOOLEAN NOT NULL,capture BOOLEAN NOT NULL,revision INTEGER NOT NULL,lastScanAt INTEGER,lastError TEXT,count INTEGER NOT NULL)');
+    await manager.query('CREATE TABLE IF NOT EXISTS asset_snapshots(id TEXT PRIMARY KEY,createdAt INTEGER NOT NULL,updatedAt INTEGER NOT NULL,assetId TEXT NOT NULL,hash TEXT NOT NULL,bytes INTEGER NOT NULL,files TEXT NOT NULL,contentCipher TEXT NOT NULL,version TEXT)');
+    await manager.query('CREATE UNIQUE INDEX IF NOT EXISTS asset_snapshot_content ON asset_snapshots(assetId,hash)');
+    await manager.query('CREATE TABLE IF NOT EXISTS asset_deployments(id TEXT PRIMARY KEY,createdAt INTEGER NOT NULL,updatedAt INTEGER NOT NULL,assetId TEXT NOT NULL,snapshotId TEXT NOT NULL,target TEXT NOT NULL,targetRoot TEXT NOT NULL,agent TEXT NOT NULL,status TEXT NOT NULL,beforeHash TEXT,afterHash TEXT NOT NULL,beforeCipher TEXT,afterCipher TEXT NOT NULL,stagePath TEXT,error TEXT,diff TEXT NOT NULL)');
+    await manager.query('CREATE INDEX IF NOT EXISTS deployments_target ON asset_deployments(target,status)');
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(11,?)',[Date.now()]);
+  });}
+  const [captureVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(captureVersion.version<12){await db.transaction(async manager=>{
+    await manager.query('CREATE TABLE IF NOT EXISTS request_captures(requestId TEXT PRIMARY KEY,requestGroupId TEXT NOT NULL,policyRevision INTEGER NOT NULL,state TEXT NOT NULL,createdAt INTEGER NOT NULL,updatedAt INTEGER NOT NULL,expiresAt INTEGER NOT NULL,bytes INTEGER NOT NULL DEFAULT 0,reason TEXT,metadataCipher TEXT NOT NULL)');
+    await manager.query('CREATE TABLE IF NOT EXISTS request_capture_parts(requestId TEXT NOT NULL,stage TEXT NOT NULL,sequence INTEGER NOT NULL,bytes INTEGER NOT NULL,bodyCipher TEXT NOT NULL,PRIMARY KEY(requestId,stage,sequence))');
+    await manager.query('CREATE INDEX IF NOT EXISTS captures_expiry ON request_captures(expiresAt)');
+    await manager.query('CREATE INDEX IF NOT EXISTS captures_group ON request_captures(requestGroupId)');
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(12,?)',[Date.now()]);
+  });}
+  const [fileIndexVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(fileIndexVersion.version<13){await db.transaction(async manager=>{
+    for(const trigger of ["session_search_insert","session_search_delete","session_search_update"]) await manager.query(`DROP TRIGGER IF EXISTS ${trigger}`);
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(13,?)',[Date.now()]);
+  });}
+  const [keyKindVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(keyKindVersion.version<14){await db.transaction(async manager=>{
+    const existing=await manager.query('PRAGMA table_info(clients)') as {name:string}[];
+    if(!existing.some(c=>c.name==='kind'))await manager.query("ALTER TABLE clients ADD COLUMN kind TEXT NOT NULL DEFAULT 'long_term'");
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(14,?)',[Date.now()]);
+  });}
+  const [observabilityVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(observabilityVersion.version<15){await db.transaction(async manager=>{
+    await manager.query('CREATE TABLE IF NOT EXISTS observability_snapshots(id TEXT PRIMARY KEY,createdAt INTEGER NOT NULL,updatedAt INTEGER NOT NULL,label TEXT NOT NULL,hash TEXT NOT NULL,summary TEXT NOT NULL,contentCipher TEXT NOT NULL)');
+    await manager.query('CREATE INDEX IF NOT EXISTS observability_snapshots_created ON observability_snapshots(createdAt DESC)');
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(15,?)',[Date.now()]);
+  });}
+  const [trajectoryVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(trajectoryVersion.version<16){await db.transaction(async manager=>{
+    await manager.query('CREATE TABLE IF NOT EXISTS trajectory_call_context(requestId TEXT PRIMARY KEY REFERENCES traffic(id) ON DELETE CASCADE,sessionKey TEXT NOT NULL,ownerKey TEXT NOT NULL,agent TEXT,nativeSessionId TEXT,nativeTurnId TEXT,stepId TEXT,runId TEXT,turnNumber INTEGER,evidence TEXT NOT NULL,project TEXT,createdAt INTEGER NOT NULL)');
+    await manager.query('CREATE INDEX IF NOT EXISTS trajectory_context_session ON trajectory_call_context(sessionKey,createdAt,requestId)');
+    await manager.query('CREATE INDEX IF NOT EXISTS trajectory_context_native ON trajectory_call_context(agent,nativeSessionId,project)');
+    await manager.query('CREATE INDEX IF NOT EXISTS trajectory_traffic_run ON traffic(runId,createdAt,id)');
+    await manager.query('CREATE INDEX IF NOT EXISTS trajectory_traffic_affinity ON traffic(affinityId,createdAt,id)');
+    await manager.query('CREATE INDEX IF NOT EXISTS trajectory_sessions_native ON sessions(agent,nativeId,project)');
+    await manager.query('CREATE INDEX IF NOT EXISTS trajectory_run_events ON run_events(runId,createdAt,id)');
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(16,?)',[Date.now()]);
+  });}
+  const [snapshotVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(snapshotVersion.version<17){await db.transaction(async manager=>{
+    await manager.query('CREATE TABLE IF NOT EXISTS trajectory_snapshots(id TEXT PRIMARY KEY,createdAt INTEGER NOT NULL,expiresAt INTEGER NOT NULL,label TEXT NOT NULL,sessionKey TEXT NOT NULL,nodeKind TEXT NOT NULL,nodeId TEXT NOT NULL,hash TEXT NOT NULL,bytes INTEGER NOT NULL,coverage TEXT NOT NULL,state TEXT NOT NULL,stages TEXT NOT NULL)');
+    await manager.query('CREATE INDEX IF NOT EXISTS trajectory_snapshots_session ON trajectory_snapshots(sessionKey,createdAt,id)');
+    await manager.query('CREATE INDEX IF NOT EXISTS trajectory_snapshots_expiry ON trajectory_snapshots(state,expiresAt)');
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(17,?)',[Date.now()]);
+  });}
+  const [timingVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(timingVersion.version<19){await db.transaction(async manager=>{
+    const existing=await manager.query('PRAGMA table_info(traffic)') as {name:string}[];
+    for(const [name,type] of [['firstTokenMs','INTEGER'],['decodingMs','INTEGER']] as const)if(!existing.some(c=>c.name===name))await manager.query(`ALTER TABLE traffic ADD COLUMN ${name} ${type}`);
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(19,?)',[Date.now()]);
+  });}
+  const [mcpContextVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(mcpContextVersion.version<18){await db.transaction(async manager=>{
+    const columns={sessionKey:'TEXT',nativeSessionId:'TEXT',nativeTurnId:'TEXT',runId:'TEXT',parentCallId:'TEXT',evidence:'TEXT'};
+    const existing=await manager.query('PRAGMA table_info(mcp_calls)') as {name:string}[];
+    for(const [name,type] of Object.entries(columns))if(!existing.some(c=>c.name===name))await manager.query(`ALTER TABLE mcp_calls ADD COLUMN ${name} ${type}`);
+    await manager.query('CREATE INDEX IF NOT EXISTS mcp_calls_session ON mcp_calls(sessionKey,createdAt,id)');
+    await manager.query('CREATE INDEX IF NOT EXISTS mcp_calls_run ON mcp_calls(runId,createdAt,id)');
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(18,?)',[Date.now()]);
+  });}
+  const [mcpRepairVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(mcpRepairVersion.version<20){await db.transaction(async manager=>{
+    const columns={sessionKey:'TEXT',nativeSessionId:'TEXT',nativeTurnId:'TEXT',runId:'TEXT',parentCallId:'TEXT',evidence:'TEXT'};
+    const existing=await manager.query('PRAGMA table_info(mcp_calls)') as {name:string}[];
+    for(const [name,type] of Object.entries(columns))if(!existing.some(c=>c.name===name))await manager.query(`ALTER TABLE mcp_calls ADD COLUMN ${name} ${type}`);
+    await manager.query('CREATE INDEX IF NOT EXISTS mcp_calls_session ON mcp_calls(sessionKey,createdAt,id)');
+    await manager.query('CREATE INDEX IF NOT EXISTS mcp_calls_run ON mcp_calls(runId,createdAt,id)');
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(20,?)',[Date.now()]);
+  });}
+  await db.query("UPDATE request_captures SET state='partial',reason='gateway_restarted',updatedAt=? WHERE state='recording'",[Date.now()]);
+  await db.query("UPDATE asset_deployments SET status='uncertain',error='gateway_restarted',updatedAt=? WHERE status IN ('applying','restoring')",[Date.now()]);
   await db.query("UPDATE debug_attempts SET status='uncertain',error='gateway_restarted',endedAt=? WHERE status='running'",[Date.now()]);
-  await db.query("UPDATE background_jobs SET status=CASE WHEN kind IN ('registry.scan','sessions.scan','sessions.search','provider.probe','mcp.probe') THEN 'queued' ELSE 'uncertain' END,phase='recovery',error='gateway_restarted',updatedAt=? WHERE status IN ('running','waiting')",[Date.now()]);
+  await db.query("UPDATE background_jobs SET status=CASE WHEN kind IN ('registry.scan','sessions.scan','sessions.search','sessions.timeline','provider.probe','mcp.probe','assets.scan','assets.search','assets.inspect','assets.snapshot','assets.preview','trajectory.snapshot','trajectory.cleanup') THEN 'queued' ELSE 'uncertain' END,phase='recovery',error='gateway_restarted',updatedAt=? WHERE status IN ('running','waiting')",[Date.now()]);
   await db.query("UPDATE route_sessions SET uncertain=1,leaseId=NULL,leaseExpiresAt=NULL WHERE leaseId IS NOT NULL");
   await db.query("UPDATE mcp_calls SET status=CASE WHEN status='running' THEN 'uncertain' ELSE 'cancelled' END,error='gateway_restarted',endedAt=?,updatedAt=? WHERE status IN ('pending','approved','running')", [Date.now(), Date.now()]);
   await db.query("UPDATE collection_sources SET state = 'idle' WHERE state = 'scanning'");

@@ -15,7 +15,7 @@ function detectLocale(): Locale {
 }
 let activeLocale:Locale=detectLocale();
 export function jobLabel(job:{kind:string;label:string}) {
-  const keys:Record<string,I18nKey>={"registry.scan":"job.label.registry","sessions.scan":"job.label.sessions","sessions.search":"job.label.search","model.debug":"job.label.model"};
+  const keys:Record<string,I18nKey>={"trajectory.snapshot":"trajectory.snapshot.save","trajectory.cleanup":"trajectory.snapshot.cleanup","registry.scan":"job.label.registry","sessions.scan":"job.label.sessions","sessions.search":"job.label.search","sessions.timeline":"job.label.sessionRead","model.debug":"job.label.model","assets.scan":"job.label.assetScan","assets.search":"job.label.assetSearch","assets.inspect":"job.label.assetRead","assets.snapshot":"job.label.assetSnapshot","assets.preview":"job.label.assetPreview","assets.apply":"job.label.assetApply","assets.restore":"job.label.assetRestore"};
   return keys[job.kind]?tr(keys[job.kind]):job.label;
 }
 export function getLocale(){return activeLocale;}

@@ -1,6 +1,7 @@
 import { tr, trError } from "./i18n";
 import { useState, type ReactNode, type FormEvent } from "react";
 import { useI18n } from "./i18n";
+import { errorKey } from "./api";
 import { Dialog, Tooltip, Select, Switch, AlertDialog } from "radix-ui";
 import { XIcon, CaretDownIcon, CheckIcon, ArrowUpRightIcon, SpinnerGapIcon, CopyIcon, PlusIcon } from "@phosphor-icons/react";
 
@@ -37,7 +38,7 @@ export function Confirm({ children, title, onConfirm }: { children: ReactNode; t
   const [busy, setBusy] = useState(false);
   const [open, setOpen] = useState(false);
   const [error, setError] = useState("");
-  return <AlertDialog.Root open={open} onOpenChange={setOpen}><AlertDialog.Trigger asChild>{children}</AlertDialog.Trigger><AlertDialog.Portal><AlertDialog.Overlay className="modal-overlay"/><AlertDialog.Content className="modal confirm-modal"><AlertDialog.Title>{title}</AlertDialog.Title><AlertDialog.Description className="sr-only">{tr("common.confirm.description")}</AlertDialog.Description>{error && <div role="alert" className="form-error">{trError(error)}</div>}<div className="form-actions"><AlertDialog.Cancel asChild><Button>{t("common.cancel")}</Button></AlertDialog.Cancel><Button className="danger" busy={busy} onClick={async () => { setBusy(true); try { await onConfirm(); setOpen(false); } catch { setError("error.operation"); } finally { setBusy(false); } }}>{t("common.confirm")}</Button></div></AlertDialog.Content></AlertDialog.Portal></AlertDialog.Root>;
+  return <AlertDialog.Root open={open} onOpenChange={setOpen}><AlertDialog.Trigger asChild>{children}</AlertDialog.Trigger><AlertDialog.Portal><AlertDialog.Overlay className="modal-overlay"/><AlertDialog.Content className="modal confirm-modal"><AlertDialog.Title>{title}</AlertDialog.Title><AlertDialog.Description className="sr-only">{tr("common.confirm.description")}</AlertDialog.Description>{error && <div role="alert" className="form-error">{trError(error)}</div>}<div className="form-actions"><AlertDialog.Cancel asChild><Button>{t("common.cancel")}</Button></AlertDialog.Cancel><Button className="danger" busy={busy} onClick={async () => { setBusy(true); setError(""); try { await onConfirm(); setOpen(false); } catch (error) { setError(errorKey(error)); } finally { setBusy(false); } }}>{t("common.confirm")}</Button></div></AlertDialog.Content></AlertDialog.Portal></AlertDialog.Root>;
 }
 export function Empty({ icon, title, action }: { icon: ReactNode; title: string; action?: ReactNode }) {
   return <div className="empty"><span className="empty-symbol">{icon}</span><span>{title}</span>{action}</div>;

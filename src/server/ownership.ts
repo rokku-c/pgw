@@ -2,8 +2,8 @@ import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import { home } from "./config";
 
-export function acquireOwnership() {
-  const connection = new Database(join(home, "gateway.sqlite"), { strict: true });
+export function acquireOwnership(database?: Database) {
+  const connection = database || new Database(join(home, "gateway.sqlite"), { strict: true });
   const owner = crypto.randomUUID();
   try {
     connection.run("PRAGMA busy_timeout = 5000");
@@ -17,6 +17,6 @@ export function acquireOwnership() {
       }
       connection.query("INSERT INTO runtime_owner(id,pid,owner) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET pid=excluded.pid,owner=excluded.owner").run(process.pid, owner);
     }).immediate();
-    return () => { connection.query("DELETE FROM runtime_owner WHERE id = 1 AND owner = ?").run(owner); connection.close(); };
-  } catch (error) { connection.close(); throw error; }
+    return () => { connection.query("DELETE FROM runtime_owner WHERE id = 1 AND owner = ?").run(owner); if (!database) connection.close(); };
+  } catch (error) { if (!database) connection.close(); throw error; }
 }

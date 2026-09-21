@@ -51,7 +51,7 @@ function RunForm({ close, saved }: { close: () => void; saved: (id: string) => v
     {error && <div role="alert" className="form-error">{trError(error)}</div>}<div className="form-actions"><Button type="button" onClick={close}>{tr("common.cancel")}</Button><Button type="submit" className="primary" busy={busy} disabled={!available.length}><PlayIcon size={14}/>{tr("common.run")}</Button></div>
   </form></Modal>;
 }
-function RunDetails({ id, close, changed }: { id: string; close: () => void; changed: () => void }) {
+export function RunDetails({ id, close, changed }: { id: string; close: () => void; changed: () => void }) {
   const resource = useResource<Run>(`/runs/${id}`, 1500), history = useResource<RunEvent[]>(`/runs/${id}/events`, 2500), funds = useResource<BudgetSummary>(`/runs/${id}/budget`, 2500);
   const [message, setMessage] = useState(""), [error, setError] = useState(""), [busy, setBusy] = useState(false), [extra, setExtra] = useState("5"), [minutes, setMinutes] = useState("10"), [budget, setBudget] = useState("");
   const run = resource.data;

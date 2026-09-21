@@ -5,6 +5,7 @@ import { adminToken, address, version, startedAt } from "./config";
 import { probeProvider } from "./providers";
 import { submitJob, jobDetail, cancelJob, retryJob, publicJob } from "./jobs";
 import { debugInput,debugAttempts,debugAttemptDetail } from "./playground";
+import { assetRoots,saveAssetRoot,listDeployments } from "./assets";
 import { listRouteSessions, deleteRouteSession, resetCircuit } from "./routing";
 import { scanRegistry } from "./collector";
 import { listSources, saveSource, scanSessions, listSessions, timeline, forgetSession, resetSource, removeSource } from "./sessions";
@@ -12,6 +13,7 @@ import { savePreference, removePreference, preferenceHistory, restorePreference,
 import { startRun, stopRun, resumeRun, steerRun, completeRun, decideApproval } from "./runtime";
 import { probeMcp, callMcp, executeMcp, validateGrants, decideMcpCall, cancelMcpCall, publicMcpCall, revokeMcpAccess } from "./mcp";
 import { budgetSummary } from "./budget";
+import { capturePolicy, configureCapture, inspectCapture, captureStage, deleteCapture, deleteAllCaptures, inspectTrajectory, compareTrajectory, trajectorySessions, trajectoryNodes, trajectoryNodeDetail, contextSnapshots, inspectContextSnapshot, compareContextSnapshots, deleteContextSnapshot } from "./observability";
 import type { Provider, ClientKey, Dashboard, McpConnection } from "../shared/types";
 
 const name = z.string().trim().min(1).max(100);
@@ -24,7 +26,9 @@ const routeInput = z.object({ alias: z.string().trim().regex(/^[\w.\-/:]{1,150}$
 const preferenceInput = z.object({ title: name, content: z.string().trim().min(1).max(3000), scope: z.enum(["global", "project"]),
   project: z.string().trim().max(500).nullable().default(null), status: z.enum(["candidate", "active", "paused"]).default("active") });
 const grantInput = z.object({ connectionId: z.string().uuid(), schemaHash: z.string().length(64), tools: z.array(z.string().max(200)).max(2000).default([]), resources: z.array(z.string().max(4096)).max(2000).default([]), prompts: z.array(z.string().max(200)).max(2000).default([]), requireApproval: z.boolean().default(true) });
-const clientInput = z.object({ name, project: z.string().trim().max(500).nullable().default(null), personalize: z.boolean().default(false), routeIds: z.array(z.string().uuid()).max(200).default([]), budgetMicros: z.number().int().min(0).max(1e12).nullable().default(null), tokenLimit: z.number().int().min(1).max(1e12).nullable().default(null), maxConcurrent: z.number().int().min(1).max(32).default(4), expiresAt: z.number().int().min(Date.now()).nullable().default(null), mcpGrants: z.array(grantInput).max(40).default([]), memoryAccess: z.boolean().default(false) });
+const clientInput = z.object({ name, kind: z.enum(["long_term", "temporary"]).default("long_term"), project: z.string().trim().max(500).nullable().default(null), personalize: z.boolean().default(false), routeIds: z.array(z.string().uuid()).max(200).default([]), budgetMicros: z.number().int().min(0).max(1e12).nullable().default(null), tokenLimit: z.number().int().min(1).max(1e12).nullable().default(null), maxConcurrent: z.number().int().min(1).max(32).default(4), expiresAt: z.number().int().min(Date.now()).nullable().default(null), mcpGrants: z.array(grantInput).max(40).default([]), memoryAccess: z.boolean().default(false) }).superRefine((input, context) => {
+  if (input.kind === "temporary" && input.expiresAt === null) context.addIssue({ code: "custom", path: ["expiresAt"], message: "temporary_key_expiry_required" });
+});
 function publicProvider(p: Provider) { const { secretCipher, ...rest } = p; return { ...rest, hasSecret: !!secretCipher }; }
 function publicClient(p: ClientKey) { const { keyHash, ...rest } = p; return rest; }
 async function get<T extends object>(schema: any, id: string): Promise<any> {
@@ -41,7 +45,12 @@ export async function api(request: Request) {
   }
   requireAdmin(request);
   if (path === "/auth/session" && method === "DELETE") return Response.json({ ok: true }, { headers: { "set-cookie": "pgw_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" } });
-  if (path === "/status" && method === "GET") return Response.json({ version, uptime: Date.now() - startedAt, address, database: "sqlite", personalization: await setting("personalization", true), captureBodies: false });
+  if (path === "/status" && method === "GET") return Response.json({ version, uptime: Date.now() - startedAt, address, database: "sqlite", personalization: await setting("personalization", true), captureBodies: (await capturePolicy()).enabled });
+  if (path === "/observability" && method === "GET") return Response.json(await capturePolicy());
+  if (path === "/observability" && method === "PATCH") { const input = z.object({ enabled:z.boolean(), retentionDays:z.number().int().min(1).max(365), maxStageBytes:z.number().int().min(65536).max(16*1024*1024), maxStorageBytes:z.number().int().min(1024*1024).max(4*1024*1024*1024) }).parse(await readJson(request)); return Response.json(await configureCapture(input)); }
+  if (path === "/observability/captures" && method === "DELETE") return Response.json(await deleteAllCaptures());
+  if(path==="/observability/snapshots"&&method==="GET")return Response.json((await db.query("SELECT id,createdAt,updatedAt,label,hash,summary FROM observability_snapshots ORDER BY createdAt DESC LIMIT 100")).map((row:any)=>({...row,summary:JSON.parse(row.summary),legacy:true})));
+  if(path.startsWith("/observability/snapshots")||path==="/observability/timeline")throw new ApiError(410,"snapshot_context_required");
   if (path === "/dashboard" && method === "GET") {
     const since = Date.now() - 86_400_000;
     const [counts] = await db.query(`SELECT count(*) as requests, sum(CASE WHEN status = 'running' THEN 1 ELSE 0 END) as running,
@@ -142,13 +151,97 @@ export async function api(request: Request) {
   if (routeSession && method === "DELETE") return Response.json(await deleteRouteSession(routeSession[1]));
   const circuit = path.match(/^\/routing\/circuits\/([^/]+)\/reset$/);
   if (circuit && method === "POST") return Response.json(await resetCircuit(circuit[1]));
+  if(path==="/trajectory/snapshots"&&method==="POST"){
+    const input=z.object({key:z.string().regex(/^(scanned|managed|external|route|call):[a-zA-Z0-9-]{1,100}$/),kind:z.enum(["traffic","session_event","run_event","approval","mcp_call"]),nodeId:z.string().min(1).max(100),label:z.string().trim().max(160).optional(),retentionDays:z.number().int().min(1).max(365).default(7),confirmed:z.literal(true)}).parse(await readJson(request));
+    return Response.json({job:await submitJob("trajectory.snapshot","trajectory.snapshot",input)},{status:202});
+  }
+  if(path==="/trajectory/snapshots"&&method==="GET"){
+    const input=z.object({key:z.string().min(1).max(160),offset:z.coerce.number().int().min(0).max(1000000).default(0),limit:z.coerce.number().int().min(1).max(100).default(30)}).parse(Object.fromEntries(url.searchParams));
+    return Response.json(await contextSnapshots(input,request.signal));
+  }
+  const contextSnapshot=path.match(/^\/trajectory\/snapshots\/([^/]+)(?:\/(inspect|diff|export))?$/);
+  if(contextSnapshot){
+    const id=z.string().uuid().parse(contextSnapshot[1]);
+    if(method==="DELETE"&&!contextSnapshot[2])return Response.json(await deleteContextSnapshot(id));
+    if(method==="GET"&&["inspect","diff","export"].includes(contextSnapshot[2])){
+      const input=z.object({stage:z.enum(["request","effective","upstream","response","output","node"]).optional(),format:z.enum(["structured","raw","manifest"]).optional(),offset:z.coerce.number().int().min(0).max(1000000).default(0),limit:z.coerce.number().int().min(1).max(50).default(25),section:z.enum(["system","messages","tools","config","transport","output","other"]).optional(),block:z.string().max(400).optional(),start:z.coerce.number().int().min(0).max(128*1024*1024).default(0),against:z.string().uuid().optional(),change:z.coerce.number().int().min(0).max(1000000).optional(),side:z.enum(["before","after"]).optional()}).parse(Object.fromEntries(url.searchParams));
+      if(contextSnapshot[2]==="inspect")return Response.json(await inspectContextSnapshot({id,...input},request.signal));
+      if(contextSnapshot[2]==="diff"){
+        if(!input.against)throw new ApiError(400,"snapshot_compare_required");
+        return Response.json(await compareContextSnapshots({before:input.against,after:id,...input},request.signal));
+      }
+      const first:any=await inspectContextSnapshot({id,stage:input.stage,format:"raw",start:0},request.signal);
+      let page:any=first,ended=false;
+      return new Response(new ReadableStream({async pull(controller){
+        try{if(ended){controller.close();return;}controller.enqueue(new TextEncoder().encode(page.text));if(page.next===null){ended=true;return;}page=await inspectContextSnapshot({id,stage:input.stage,format:"raw",start:page.next},request.signal);}catch(error){controller.error(error);}
+      }}),{headers:{"content-type":"text/plain; charset=utf-8","content-disposition":`attachment; filename="snapshot-${id}-${input.stage||"body"}.txt"`}});
+    }
+  }
+  if(path==="/trajectory/sessions"&&method==="GET"){
+    const input=z.object({kind:z.enum(["scanned","managed","independent"]).optional(),query:z.string().max(300).optional(),cursor:z.string().max(3000).optional(),limit:z.coerce.number().int().min(1).max(100).default(40)}).parse(Object.fromEntries(url.searchParams));
+    return Response.json(await trajectorySessions(input,request.signal));
+  }
+  const trajectorySession=path.match(/^\/trajectory\/sessions\/([^/]+)\/(nodes|node)$/);
+  if(trajectorySession&&method==="GET"){
+    const key=decodeURIComponent(trajectorySession[1]);
+    if(!/^(scanned|managed|external|route|call):[a-zA-Z0-9-]{1,100}$/.test(key))throw new ApiError(400,"invalid_session_key");
+    if(trajectorySession[2]==="nodes"){
+      const input=z.object({offset:z.coerce.number().int().min(0).max(10000000).default(0),limit:z.coerce.number().int().min(1).max(100).default(40),revision:z.string().max(500).optional()}).parse(Object.fromEntries(url.searchParams));
+      return Response.json(await trajectoryNodes({key,...input},request.signal));
+    }
+    const input=z.object({kind:z.enum(["traffic","session_event","run_event","approval","mcp_call"]),id:z.string().min(1).max(100),start:z.coerce.number().int().min(0).max(64*1024*1024).default(0)}).parse(Object.fromEntries(url.searchParams));
+    return Response.json(await trajectoryNodeDetail({key,...input},request.signal));
+  }
+  const trajectoryCall=path.match(/^\/trajectory\/calls\/([^/]+)\/(inspect|diff)$/);
+  if(trajectoryCall&&method==="GET"){
+    const item=await get(TrafficSchema,trajectoryCall[1]);
+    const input=z.object({stage:z.enum(["request","effective","upstream","response","output"]).default("effective"),offset:z.coerce.number().int().min(0).max(1000000).default(0),limit:z.coerce.number().int().min(1).max(50).default(30),section:z.enum(["system","messages","tools","config","transport","output","other"]).optional(),block:z.string().max(400).optional(),start:z.coerce.number().int().min(0).max(64*1024*1024).optional(),against:z.string().uuid().optional()}).parse(Object.fromEntries(url.searchParams));
+    if(trajectoryCall[2]==="inspect")return Response.json(await inspectTrajectory({id:item.id,...input},request.signal));
+    if(!input.against)throw new ApiError(400,"snapshot_compare_required");
+    await get(TrafficSchema,input.against);
+    return Response.json(await compareTrajectory({before:input.against,after:item.id,...input},request.signal));
+  }
+  const captureDetail = path.match(/^\/traffic\/([^/]+)\/capture(?:\/(request|effective|upstream|response|output))?$/);
+  if (captureDetail) {
+    const item = await get(TrafficSchema, captureDetail[1]);
+    if (method === "DELETE" && !captureDetail[2]) return Response.json(await deleteCapture(item.id));
+    if (method === "GET" && captureDetail[2]) return Response.json(await captureStage(item.id, captureDetail[2] as any, Number(url.searchParams.get("after") || -1)));
+    if (method === "GET" && !captureDetail[2]) return Response.json(await inspectCapture(item.id));
+  }
   const trafficDetail = path.match(/^\/traffic\/([^/]+)$/);
   if (trafficDetail && method === "GET") {
     const item = await get(TrafficSchema, trafficDetail[1]);
     const attempts = item.requestGroupId ? await db.getRepository(TrafficSchema).find({ where: { requestGroupId: item.requestGroupId }, order: { createdAt: "ASC" } }) : [item];
-    return Response.json({ request: item, attempts });
+    const capture = await inspectCapture(item.id).catch(error => error instanceof ApiError && error.status === 404 ? null : Promise.reject(error));
+    const sessionRequests = item.affinityId ? await db.getRepository(TrafficSchema).find({ where: { affinityId: item.affinityId }, order: { createdAt: "ASC" }, take: 100 }) : [];
+    return Response.json({ request: item, attempts, capture, sessionRequests });
   }
   if (path === "/traffic" && method === "GET") return Response.json(await db.getRepository(TrafficSchema).find({ order: { createdAt: "DESC" }, take: 200 }));
+  if(path==="/asset-roots"&&method==="GET")return Response.json(await assetRoots());
+  const assetRoot=path.match(/^\/asset-roots\/([^/]+)(?:\/(scan))?$/);
+  if(path==="/asset-roots"&&method==="POST"||assetRoot&&!assetRoot[2]&&method==="PATCH"){
+    const input=z.object({name,agent:z.enum(["claude","codex","pi","shared"]),path:z.string().min(1).max(4096),project:z.string().max(4096).nullable().default(null),enabled:z.boolean().default(true),followSymlinks:z.boolean().default(false),capture:z.boolean().default(false),revision:z.number().int().positive().optional()}).parse(await readJson(request));
+    return Response.json(await saveAssetRoot(input,assetRoot?.[1],input.revision));
+  }
+  if(assetRoot&&assetRoot[2]==="scan"&&method==="POST")return Response.json({job:await submitJob("assets.scan","Scan skills",{rootId:assetRoot[1]})},{status:202});
+  if(path==="/skills"&&method==="GET"){
+    const input=z.object({query:z.string().max(200).optional(),offset:z.coerce.number().int().min(0).default(0),limit:z.coerce.number().int().min(1).max(100).default(40),rootId:z.string().uuid().optional(),duplicates:z.enum(["true","false"]).optional()}).parse(Object.fromEntries(url.searchParams));
+    return Response.json({job:await submitJob("assets.search","Search skills",{...input,duplicates:input.duplicates==="true"},false)},{status:202});
+  }
+  const assetDetail=path.match(/^\/assets\/([^/]+)(?:\/(snapshot|deploy))?$/);
+  if(assetDetail){
+    if(method==="GET"&&!assetDetail[2])return Response.json({job:await submitJob("assets.inspect","Read skill",{id:assetDetail[1]})},{status:202});
+    if(method==="POST"&&assetDetail[2]==="snapshot"){z.object({confirmed:z.literal(true)}).parse(await readJson(request));return Response.json({job:await submitJob("assets.snapshot","Snapshot skill",{id:assetDetail[1]})},{status:202});}
+    if(method==="POST"&&assetDetail[2]==="deploy"){
+      const input=z.object({snapshotId:z.string().uuid(),targetRoot:z.string().min(1).max(4096),name:z.string().min(1).max(100),agent:z.enum(["claude","codex","pi","shared"])}).parse(await readJson(request));
+      return Response.json({job:await submitJob("assets.preview","Preview installation",{...input,assetId:assetDetail[1]},false)},{status:202});
+    }
+  }
+  const snapshot=path.match(/^\/asset-snapshots\/([^/]+)$/);
+  if(snapshot&&method==="GET")return Response.json({job:await submitJob("assets.inspect","Read snapshot",{snapshotId:snapshot[1]})},{status:202});
+  if(path==="/asset-deployments"&&method==="GET")return Response.json(await listDeployments());
+  const deployment=path.match(/^\/asset-deployments\/([^/]+)\/(apply|restore)$/);
+  if(deployment&&method==="POST"){z.object({confirmed:z.literal(true)}).parse(await readJson(request));return Response.json({job:await submitJob(deployment[2]==="apply"?"assets.apply":"assets.restore",deployment[2]==="apply"?"Install skill":"Restore installation",{id:deployment[1]},false)},{status:202});}
   if (path === "/assets" && method === "GET") return Response.json(await db.getRepository(AssetSchema).find({ order: { kind: "ASC", name: "ASC" } }));
   if (path === "/registry/scan" && method === "POST") return Response.json({job:await submitJob("registry.scan","扫描资产",{})},{status:202});
   if (path === "/sources" && method === "GET") return Response.json(await listSources());
@@ -166,7 +259,7 @@ export async function api(request: Request) {
   if (path === "/sessions" && method === "GET") {
     if (!url.searchParams.has("paged")) return Response.json((await listSessions({ limit: 200 })).items);
     const input = z.object({ query: z.string().max(200).optional(), agent: z.enum(["claude", "codex", "pi", "auto"]).optional(), project: z.string().max(4096).optional(), sourceId: z.string().max(100).optional(), offset: z.coerce.number().int().min(0).default(0), limit: z.coerce.number().int().min(1).max(200).default(50), archived: z.enum(["true", "false"]).optional(), starred: z.enum(["true", "false"]).optional() }).parse(Object.fromEntries(url.searchParams));
-    return Response.json({job:await submitJob("sessions.search","搜索会话",{ ...input, archived: input.archived === undefined ? undefined : input.archived === "true", starred: input.starred === "true" })},{status:202});
+    return Response.json({job:await submitJob("sessions.search","搜索会话",{ ...input, archived: input.archived === undefined ? undefined : input.archived === "true", starred: input.starred === "true" },false)},{status:202});
   }
   const sessionMatch = path.match(/^\/sessions\/([^/]+)(?:\/(timeline|export))?$/);
   if (sessionMatch) {
@@ -177,8 +270,8 @@ export async function api(request: Request) {
     }
     if (method === "GET") {
       const input = z.object({ after: z.coerce.number().int().min(0).optional(), limit: z.coerce.number().int().min(1).max(200).default(100), query: z.string().max(200).optional(), leaf: z.string().max(200).optional() }).parse(Object.fromEntries(url.searchParams));
+      if (sessionMatch[2] === "timeline") return Response.json({job:await submitJob("sessions.timeline","读取会话",{id:sessionMatch[1],options:input},false)},{status:202});
       const result = await timeline(sessionMatch[1], input);
-      if (sessionMatch[2] === "timeline") return Response.json(result);
       if (sessionMatch[2] === "export") {
         let page: typeof result | undefined = result, cursor = result.next, ended = false;
         const encoder = new TextEncoder();
@@ -199,10 +292,12 @@ export async function api(request: Request) {
       return Response.json({ ...result, messages: result.events.filter(e => e.text && ["user", "assistant"].includes(e.role)).map(e => ({ role: e.role, text: e.text })), partial: result.next !== null || result.session.status !== "indexed" });
     }
   }
-  if (path === "/settings" && method === "GET") return Response.json({ personalization: await setting("personalization", true) });
+  if (path === "/settings" && method === "GET") return Response.json({ personalization: await setting("personalization", true), observability: await capturePolicy() });
   if (path === "/settings" && method === "PATCH") {
-    const input = z.object({ personalization: z.boolean() }).parse(await readJson(request));
-    await saveSetting("personalization", input.personalization); await audit("settings.updated", "personalization", input); return Response.json(input);
+    const input = z.object({ personalization: z.boolean().optional(), observability: z.object({ enabled:z.boolean(), retentionDays:z.number().int().min(1).max(365), maxStageBytes:z.number().int().min(65536).max(16*1024*1024), maxStorageBytes:z.number().int().min(1024*1024).max(4*1024*1024*1024) }).optional() }).refine(value => value.personalization !== undefined || value.observability !== undefined).parse(await readJson(request));
+    if(input.personalization !== undefined) await saveSetting("personalization", input.personalization);
+    if(input.observability) await configureCapture(input.observability);
+    await audit("settings.updated", "settings", input); return Response.json({ personalization: await setting("personalization", true), observability: await capturePolicy() });
   }
   const publicMcp = (item: McpConnection) => { const { envCipher, headersCipher, ...rest } = item; return { ...rest, hasEnv: !!envCipher, hasHeaders: !!headersCipher }; };
   if (path === "/mcp" && method === "GET") return Response.json((await db.getRepository(McpSchema).find({ order: { createdAt: "DESC" } })).map(publicMcp));

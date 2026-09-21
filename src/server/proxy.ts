@@ -1,6 +1,7 @@
 import { z } from "zod";
+import { callContext, recordCallContext } from "./trajectory-context";
 import { db, ClientSchema, RouteSchema, ProviderSchema, TrafficSchema, PreferenceSchema, record, setting, audit } from "./store";
-import { ApiError, bearer, hash, readJson } from "./security";
+import { ApiError, bearer, hash, readJson, requestBodyBytes, requestBodySize } from "./security";
 import { endpoint, upstreamHeaders } from "./providers";
 import { boundOutput, reserveBudget, settleBudget } from "./budget";
 import { emptyUsage, mergeUsage, usageCost, type Usage } from "./usage";
@@ -8,6 +9,7 @@ import { convertRequest, convertResponse } from "./protocols";
 import { StreamConversion } from "./stream-conversion";
 import { EventStreamParser, type ServerEvent } from "./event-stream";
 import { balancedTargets, beginRouteSession, frozenPreferences, pinRoute, recordResponse, releaseRouteSession, unpinRejectedRoute, responseBinding, providerFingerprint, circuitPermit, circuitResult, retryAfter, type FrozenPreference, type RouteSession } from "./routing";
+import { beginCapture, capturePolicy, captureHeaders, captureUrl, type RequestCapture } from "./observability";
 import type { ClientKey, ModelRoute, Traffic, WireProtocol, Provider, Target } from "../shared/types";
 
 export function extractUsage(body: any) { return mergeUsage(emptyUsage(),body,body?.usageMetadata?"gemini":"responses"); }
@@ -76,18 +78,21 @@ export async function proxy(request:Request):Promise<Response> {
   const gemini=path.match(/^\/v1beta\/models\/(.+):(generateContent|streamGenerateContent)$/);
   const protocol:WireProtocol|undefined=gemini?"gemini":({"/v1/responses":"responses","/v1/chat/completions":"chat","/v1/messages":"messages"} as Record<string,WireProtocol>)[path];
   if(!protocol || request.method!=="POST")throw new ApiError(404,"endpoint_not_found");
-  const original=await readJson(request,16*1024*1024);
+  const captureConfig=await capturePolicy();
+  const original=await readJson(request,16*1024*1024,captureConfig.enabled);
   if(gemini && original && typeof original==="object" && !Array.isArray(original)){ original.model=decodeURIComponent(gemini[1]);original.stream=gemini[2]==="streamGenerateContent"; }
   validate(original,protocol);
   const route=allowed.find(r=>r.alias===original.model);
   if(!route)throw new ApiError(404,"model_not_available");
   if(!route.targets.length)throw new ApiError(503,"route_unavailable");
   const group=crypto.randomUUID();
-  const session=await beginRouteSession(client,{...route,protocol},request.headers.get("x-pgw-session"),original.previous_response_id,group);
+  const sessionKey=request.headers.get("x-pgw-session");
+  const session=await beginRouteSession(client,{...route,protocol},sessionKey,original.previous_response_id,group);
   let detached=false,uncertain=false;
   const decisions:Traffic["decisions"]=[];
   try {
-    const {body,prefs,reason}=await personalize(original,protocol,client,session);
+    const context=await callContext(request,client,group,session?.id||null);
+    const {body,prefs,reason}=await personalize(structuredClone(original),protocol,client,session);
     decisions.push({action:"personalization",reason});
     const outputTokens=boundOutput(body,{...route,protocol});
     await db.getRepository(ClientSchema).update(client.id,{lastUsedAt:Date.now()});
@@ -108,8 +113,13 @@ export async function proxy(request:Request):Promise<Response> {
       decisions.push({action:circuit.allowed?"select":"skip",target:provider.id,reason:session?.providerId?`session_pinned:${circuit.reason}`:circuit.reason});
       if(!circuit.allowed){ lastError=new ApiError(503,"circuit_open");continue; }
       const started=Date.now();
-      const traffic:Traffic={...record(),clientId:client.id,clientName:client.name,routeId:route.id,model:route.alias,providerId:provider.id,providerName:provider.name,protocol,status:"running",upstreamStatus:null,latencyMs:null,firstByteMs:null,...emptyUsage(),costMicros:null,error:null,stream:!!body.stream,project:client.project,patchIds:prefs.map(p=>`${p.id}:${p.revision}`),runId:client.runId,accounting:"pending",pricing:{input:route.inputPrice,output:route.outputPrice,cacheRead:route.cacheReadPrice,cacheWrite:route.cacheWritePrice,cacheWriteLong:route.cacheWriteLongPrice},requestGroupId:group,affinityId:session?.id||null,responseId:null,decisions:[...decisions]};
-      try{ await reserveBudget(traffic.id,client,route,outputTokens,{key:`${route.id}:${target.providerId}:${target.model}`,maxConcurrent:target.maxConcurrent}); await db.getRepository(TrafficSchema).save(traffic); }
+      const traffic:Traffic={...record(),clientId:client.id,clientName:client.name,routeId:route.id,model:route.alias,providerId:provider.id,providerName:provider.name,protocol,status:"running",upstreamStatus:null,latencyMs:null,firstByteMs:null,firstTokenMs:null,decodingMs:null,...emptyUsage(),costMicros:null,error:null,stream:!!body.stream,project:client.project,patchIds:prefs.map(p=>`${p.id}:${p.revision}`),runId:client.runId,accounting:"pending",pricing:{input:route.inputPrice,output:route.outputPrice,cacheRead:route.cacheReadPrice,cacheWrite:route.cacheWritePrice,cacheWriteLong:route.cacheWriteLongPrice},requestGroupId:group,affinityId:session?.id||null,responseId:null,decisions:[...decisions]};
+      let capture:RequestCapture = { json(){}, chunk(){}, metadata(){}, secret(){}, finish(){} };
+      try{ await reserveBudget(traffic.id,client,route,outputTokens,{key:`${route.id}:${target.providerId}:${target.model}`,maxConcurrent:target.maxConcurrent}); await db.getRepository(TrafficSchema).save(traffic);
+        await recordCallContext(traffic,context);
+        capture=beginCapture(captureConfig,traffic.id,group,{method:request.method,requestUrl:captureUrl(request.url),requestHeaders:captureHeaders(request.headers),protocol,model:route.alias,provider:provider.name,client:client.name,bodyBytes:requestBodySize(request),stream:!!body.stream,upstreamProtocol:upstreamWire,converted,context},[key]);
+        const incoming=requestBodyBytes(request);if(incoming)capture.chunk("request",incoming);
+      }
       catch(error){ await settleBudget(traffic.id,traffic,true);await circuitResult(circuit.id,false,null);if(error instanceof ApiError&&error.code==="target_concurrency_limit"){decisions.push({action:"skip",target:provider.id,reason:error.code});continue;}throw error; }
       const controller=new AbortController();
       let idleTimer:ReturnType<typeof setTimeout>,output:ReadableStreamDefaultController<Uint8Array>|undefined,reader:ReadableStreamDefaultReader<Uint8Array>|undefined;
@@ -128,11 +138,13 @@ export async function proxy(request:Request):Promise<Response> {
           if(knownRejected){traffic.inputTokens=0;traffic.outputTokens=0;traffic.costMicros=0;}
           else if(terminal&&status==="completed")traffic.costMicros=usageCost(usage,traffic.pricing);
           traffic.accounting=knownRejected?"rejected":terminal&&status==="completed"&&usage.inputTokens!==null&&usage.outputTokens!==null?"reported":"estimated";
+          traffic.decodingMs=terminal&&traffic.firstTokenMs!==null?Math.max(0,Date.now()-started-traffic.firstTokenMs):null;
           uncertain=submitted&&!rejected&&!terminal;
           await settleBudget(traffic.id,terminal&&status==="completed"?traffic:{inputTokens:null,outputTokens:null,costMicros:null},knownRejected);
           if(terminal && protocol==="responses" && upstreamWire==="responses" && traffic.responseId)await recordResponse(session,traffic.responseId,target,provider,responseStatus,group);
           if(knownRejected)await unpinRejectedRoute(session,group);
-          await db.getRepository(TrafficSchema).update(traffic.id,{status,error,latencyMs:Date.now()-started,firstByteMs:traffic.firstByteMs,upstreamStatus:traffic.upstreamStatus,inputTokens:traffic.inputTokens,outputTokens:traffic.outputTokens,cacheReadTokens:traffic.cacheReadTokens,cacheWriteTokens:traffic.cacheWriteTokens,cacheWriteLongTokens:traffic.cacheWriteLongTokens,reasoningTokens:traffic.reasoningTokens,costMicros:traffic.costMicros,accounting:traffic.accounting,responseId:traffic.responseId,updatedAt:Date.now()});
+          await db.getRepository(TrafficSchema).update(traffic.id,{status,error,latencyMs:Date.now()-started,firstByteMs:traffic.firstByteMs,firstTokenMs:traffic.firstTokenMs,decodingMs:traffic.decodingMs,upstreamStatus:traffic.upstreamStatus,inputTokens:traffic.inputTokens,outputTokens:traffic.outputTokens,cacheReadTokens:traffic.cacheReadTokens,cacheWriteTokens:traffic.cacheWriteTokens,cacheWriteLongTokens:traffic.cacheWriteLongTokens,reasoningTokens:traffic.reasoningTokens,costMicros:traffic.costMicros,accounting:traffic.accounting,responseId:traffic.responseId,updatedAt:Date.now()});
+          capture.finish(status,error);
           const upstreamFailure=error && error!=="client_cancelled" && ![400,401,403,404,413,422].includes(traffic.upstreamStatus||0)?error:null;
           await circuitResult(circuit.id,status==="completed",upstreamFailure,traffic.upstreamStatus===429?cooldown:null);
         })();
@@ -148,6 +160,7 @@ export async function proxy(request:Request):Promise<Response> {
         if(request.signal.aborted)throw new ApiError(499,"client_cancelled");
         await pinRoute(session,target,provider,prefs,group);
         const payload=upstreamPayload;
+        capture.json("effective",body,requestBodySize(request)+16384);
         if(converted&&upstreamWire!=="gemini")payload.stream=!!body.stream;
         let upstreamPath=upstreamWire==="responses"?"/responses":upstreamWire==="chat"?"/chat/completions":"/messages";
         if(upstreamWire==="gemini"){delete payload.model;delete payload.stream;upstreamPath=`/models/${encodeURIComponent(target.model)}:${body.stream?"streamGenerateContent?alt=sse":"generateContent"}`;}
@@ -155,12 +168,14 @@ export async function proxy(request:Request):Promise<Response> {
         const headers=upstreamHeaders(provider);
         const beta=request.headers.get("anthropic-beta");if(upstreamWire==="messages"&&beta&&!converted)headers.set("anthropic-beta",beta);
         const reqId=request.headers.get("x-client-request-id");if(reqId&&reqId.length<=200)headers.set("x-client-request-id",reqId);
+        capture.json("upstream",{method:"POST",url:captureUrl(endpoint(provider,upstreamPath)),headers:captureHeaders(headers),body:payload},JSON.stringify(payload).length+4096);
         submitted=true;rejected=false;uncertain=true;
         const response=await fetch(endpoint(provider,upstreamPath),{method:"POST",headers,body:JSON.stringify(payload),redirect:"error",signal:controller.signal});
-        touch();traffic.upstreamStatus=response.status;
+        touch();traffic.upstreamStatus=response.status;capture.metadata({responseStatus:response.status,responseHeaders:captureHeaders(response.headers)});
         if(!response.ok){
           rejected=[400,401,403,404,413,422,429].includes(response.status);cooldown=retryAfter(response.headers.get("retry-after"));
-          await response.body?.cancel();await finish("failed",`upstream_${response.status}`);
+          if(response.body){const errorReader=response.body.getReader();const errorChunks:Uint8Array[]=[];let errorSize=0;while(errorSize<1024*1024){const next=await errorReader.read();if(next.done)break;errorSize+=next.value.length;errorChunks.push(next.value);if(errorSize>=1024*1024)break;}capture.chunk("response",Buffer.concat(errorChunks));await errorReader.cancel().catch(()=>{});}
+          await finish("failed",`upstream_${response.status}`);
           lastError=new ApiError(response.status===429?429:502,`upstream_${response.status}`);
           if(response.status===429 && !session?.providerId){decisions.push({action:"fallback",target:provider.id,reason:"explicit_rate_limit_rejection"});continue;}
           throw lastError;
@@ -169,27 +184,31 @@ export async function proxy(request:Request):Promise<Response> {
           if(!response.body)throw new ApiError(502,"empty_upstream_response");
           reader=response.body.getReader();const chunks:Uint8Array[]=[];let size=0;
           while(true){const next=await reader.read();if(next.done)break;touch();if(traffic.firstByteMs===null)traffic.firstByteMs=Date.now()-started;size+=next.value.length;if(size>32*1024*1024)throw new ApiError(502,"upstream_response_too_large");chunks.push(next.value);}
-          const text=Buffer.concat(chunks).toString("utf8");let parsed:any;
+          const bytes=Buffer.concat(chunks);capture.chunk("response",bytes);const text=bytes.toString("utf8");let parsed:any;
           try{parsed=JSON.parse(text);}catch{throw new ApiError(502,"invalid_upstream_response");}
           if(parsed.error)throw new ApiError(502,"upstream_error_body");
           usage=mergeUsage(usage,parsed,upstreamWire);traffic.responseId=upstreamWire==="responses"&&typeof parsed.id==="string"?parsed.id:null;
           responseStatus=upstreamWire==="responses"?(parsed.status||"completed"):"completed";
+          traffic.firstTokenMs=traffic.firstByteMs;
           terminal=!['queued','in_progress'].includes(responseStatus);
           if(!terminal)throw new ApiError(502,"unexpected_background_response");
-          const answer=converted?convertResponse(parsed,upstreamWire,protocol,route.alias):null;
+          const answer=converted?convertResponse(parsed,upstreamWire,protocol,route.alias):parsed;
+          capture.chunk("output",converted?new TextEncoder().encode(JSON.stringify(answer)):bytes);
           await finish(responseStatus==="failed"?"failed":"completed",responseStatus==="failed"?"upstream_response_failed":null);
-          if(converted){return new Response(JSON.stringify(answer),{status:response.status,headers:{"content-type":"application/json","x-pgw-request-id":group,"x-pgw-attempt-id":traffic.id,"x-pgw-conversion":"json"}});}
+          if(converted)return new Response(JSON.stringify(answer),{status:response.status,headers:{"content-type":"application/json","x-pgw-request-id":group,"x-pgw-attempt-id":traffic.id,"x-pgw-conversion":"json"}});
           return new Response(text,{status:response.status,headers:{"content-type":"application/json","x-pgw-request-id":group,"x-pgw-attempt-id":traffic.id}});
         }
         if(!response.body||!response.headers.get("content-type")?.includes("text/event-stream")){await response.body?.cancel();throw new ApiError(502,"invalid_upstream_stream");}
         reader=response.body.getReader();
         let produced=false;
-        const conversion=converted?new StreamConversion(upstreamWire,protocol,route.alias,chunk=>{produced=true;output?.enqueue(chunk);}):null;
+        const conversion=converted?new StreamConversion(upstreamWire,protocol,route.alias,chunk=>{produced=true;if(traffic.firstTokenMs===null)traffic.firstTokenMs=Date.now()-started;capture.chunk("output",chunk);output?.enqueue(chunk);}):null;
+        const markToken=()=>{if(traffic.firstTokenMs===null)traffic.firstTokenMs=Date.now()-started;};
         const parse=(event:ServerEvent)=>{
           if(conversion){conversion.accept(event);usage=conversion.usage;terminal=conversion.complete;responseStatus=conversion.status;traffic.responseId=protocol==="responses"?conversion.id:conversion.upstreamId;return;}
           if(event.data==="[DONE]"){if(protocol==="chat")terminal=true;return;}
           if(["ping","keepalive"].includes(event.event) && !event.data.startsWith("{"))return;
           let item:any;try{item=JSON.parse(event.data);}catch{throw new ApiError(502,"invalid_upstream_event");}
+          if(item.choices?.some((choice:any)=>choice.delta?.content||choice.delta?.reasoning_content||choice.delta?.tool_calls?.length)||item.candidates?.some((candidate:any)=>candidate.content?.parts?.length)||["content_block_delta","response.output_text.delta","response.reasoning_summary_text.delta","response.reasoning_text.delta","response.function_call_arguments.delta","response.custom_tool_call_input.delta"].includes(item.type))markToken();
           usage=mergeUsage(usage,item,protocol);
           if(protocol==="responses"){
             if(typeof item.response?.id==="string")traffic.responseId=item.response.id;
@@ -213,13 +232,16 @@ export async function proxy(request:Request):Promise<Response> {
                   await finish(terminal&&!failure?"completed":"failed",failure||(!terminal?"stream_incomplete":null));await releaseRouteSession(session,group,uncertain);controller.close();return;
                 }
                 touch();if(traffic.firstByteMs===null)traffic.firstByteMs=Date.now()-started;
+                capture.chunk("response",next.value);
                 parser.push(next.value);
-                if(!conversion){controller.enqueue(next.value);produced=true;}
+                if(!conversion){capture.chunk("output",next.value);controller.enqueue(next.value);produced=true;}
               }
             }catch(error){
               const reason=error instanceof ApiError?error.code:controllerSignalReason();
-              await reader!.cancel().catch(()=>{});await finish(request.signal.aborted?"cancelled":"failed",reason);await releaseRouteSession(session,group,uncertain);
-              if(conversion&&!request.signal.aborted){conversion.fail(reason);controller.close();}else controller.error(new Error(reason));
+              await reader!.cancel().catch(()=>{});
+              if(conversion&&!request.signal.aborted)conversion.fail(reason);
+              await finish(request.signal.aborted?"cancelled":"failed",reason);await releaseRouteSession(session,group,uncertain);
+              if(conversion&&!request.signal.aborted)controller.close();else controller.error(new Error(reason));
             }
           },
           async cancel(){await reader!.cancel().catch(()=>{});await finish("cancelled","client_cancelled");await releaseRouteSession(session,group,uncertain);controller.abort();},

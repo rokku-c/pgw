@@ -1,15 +1,17 @@
-import { db, JobSchema, record, audit, SourceSchema, SessionSchema } from "./store";
+import { db, JobSchema, record, audit, SourceSchema, SessionSchema, AssetRootSchema } from "./store";
+import { readSessionEvents } from "./session-files";
 import { atomic } from "./transactions";
 import { encrypt, decrypt, hash, ApiError } from "./security";
 import type { BackgroundJob, JobKind, PublicJob } from "../shared/types";
 
 type Lane = { worker?: Worker; current: string | null; ticking: boolean; kinds: JobKind[] };
 const lanes: Lane[] = [
-  { current:null,ticking:false,kinds:["sessions.search"] },
-  { current:null,ticking:false,kinds:["registry.scan","sessions.scan","provider.probe","mcp.probe"] },
-  { current:null,ticking:false,kinds:["model.debug","mcp.debug"] },
+  { current:null,ticking:false,kinds:["trajectory.snapshot","trajectory.cleanup"] },
+  { current:null,ticking:false,kinds:["sessions.search","sessions.timeline","assets.search","assets.inspect"] },
+  { current:null,ticking:false,kinds:["registry.scan","sessions.scan","provider.probe","mcp.probe","assets.scan","assets.snapshot","assets.preview"] },
+  { current:null,ticking:false,kinds:["model.debug","mcp.debug","assets.apply","assets.restore"] },
 ];
-let stopping=false;
+let stopping=false,lastSnapshotCleanup=0;
 let tickTimer: ReturnType<typeof setInterval> | undefined, scanTimer: ReturnType<typeof setInterval> | undefined;
 export function publicJob(job: BackgroundJob): PublicJob { const { payloadCipher,resultCipher,dedupKey,...rest }=job; return rest; }
 export async function submitJob(kind:JobKind,label:string,payload:unknown,deduplicate=true) {
@@ -28,7 +30,16 @@ export async function submitJob(kind:JobKind,label:string,payload:unknown,dedupl
 export async function jobDetail(id:string) {
   const job=await db.getRepository(JobSchema).findOneBy({id});if(!job)throw new ApiError(404,"job_not_found");
   let result=job.resultCipher?JSON.parse(decrypt(job.resultCipher)):null;
-  if(job.kind==="sessions.search"&&result?.ids){const found=result.ids.length?await db.getRepository(SessionSchema).createQueryBuilder("s").where("s.id IN (:...ids)",{ids:result.ids}).getMany():[];const items=result.ids.map((id:string)=>found.find(s=>s.id===id)).filter(Boolean);result={items,total:result.total,next:result.next};}
+  if(job.kind==="sessions.search"&&result?.ids){const found=result.ids.length?await db.getRepository(SessionSchema).createQueryBuilder("s").where("s.id IN (:...ids)",{ids:result.ids}).getMany():[];const items=result.ids.map((id:string)=>found.find(s=>s.id===id)).filter(Boolean);result={items,total:result.total,next:result.next,unavailable:result.unavailable};}
+  if(job.kind==="sessions.timeline"&&result?.session){
+    const session=await db.getRepository(SessionSchema).findOneBy({id:result.session.id});
+    if(!session||session.generation!==result.session.generation)throw new ApiError(409,"session_file_changed");
+    const source=session.sourceId?await db.getRepository(SourceSchema).findOneBy({id:session.sourceId}):null;
+    result.events=await readSessionEvents(session,source,result.events);
+    const current=source?await db.getRepository(SourceSchema).findOneBy({id:source.id}):null;
+    if(source&&(!current||current.revision!==source.revision))throw new ApiError(409,"source_changed");
+    result.session=session;
+  }
   return {...publicJob(job),result};
 }
 export async function cancelJob(id:string) {
@@ -39,7 +50,7 @@ export async function cancelJob(id:string) {
 export async function retryJob(id:string,confirmed:boolean) {
   const job=await db.getRepository(JobSchema).findOneBy({id});if(!job)throw new ApiError(404,"job_not_found");
   if(!["completed","failed","cancelled","uncertain"].includes(job.status))throw new ApiError(409,"job_not_retryable");
-  if(["model.debug","mcp.debug"].includes(job.kind)&&!confirmed)throw new ApiError(400,"confirmation_required");
+  if(["model.debug","mcp.debug","assets.apply","assets.restore"].includes(job.kind)&&!confirmed)throw new ApiError(400,"confirmation_required");
   return submitJob(job.kind,job.label,JSON.parse(decrypt(job.payloadCipher)),false);
 }
 async function tick() {
@@ -67,8 +78,9 @@ async function tick() {
   }));
 }
 export function startScheduler() {
-  stopping=false;tickTimer=setInterval(()=>{void tick().catch(error=>console.error("Scheduler",error));},300);tickTimer.unref();
-  scanTimer=setInterval(()=>{void (async()=>{for(const source of await db.getRepository(SourceSchema).findBy({enabled:true}))await submitJob("sessions.scan",source.name,{sourceId:source.id});})().catch(error=>console.error("Scheduled collection",error));},30000);scanTimer.unref();
+  stopping=false;lastSnapshotCleanup=Date.now();tickTimer=setInterval(()=>{void tick().catch(error=>console.error("Scheduler",error));},300);tickTimer.unref();
+  scanTimer=setInterval(()=>{void (async()=>{if(Date.now()-lastSnapshotCleanup>1800000){lastSnapshotCleanup=Date.now();await submitJob("trajectory.cleanup","snapshot.cleanup",{});}for(const source of await db.getRepository(SourceSchema).findBy({enabled:true}))await submitJob("sessions.scan",source.name,{sourceId:source.id});for(const root of await db.getRepository(AssetRootSchema).findBy({enabled:true}))if(!root.lastScanAt||Date.now()-root.lastScanAt>300000)await submitJob("assets.scan",root.name,{rootId:root.id});})().catch(error=>console.error("Scheduled collection",error));},30000);scanTimer.unref();
+  void submitJob("trajectory.cleanup","snapshot.cleanup",{}).catch(error=>console.error("Snapshot cleanup",error));
   void tick();
 }
 export async function stopScheduler() {

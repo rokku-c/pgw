@@ -42,7 +42,7 @@ Personal Gateway 是本地优先的个人 AI 工作中枢：统一模型入口�
 | 语言 | TypeScript | 前后端共享数据契约，外部输入进行运行时校验 | 已明确 |
 | 运行时 | Bun | HTTP、流式转发、CLI、文件读取、受控子进程 | 已明确 |
 | 业务执行 | Effect | 错误分类、并发限制、取消、超时、资源生命周期 | 已明确方向，依赖版本实施时锁定 |
-| 存储 | SQLite | 业务数据、索引、任务状态、审计 | 已明确 |
+| 存储 | SQLite + 原生文件系统 | 业务状态、轻量定位、审计；原始会话按需读取 | 已明确 |
 | ORM | TypeORM + Bun SQLite 驱动适配 | 实体、查询、事务与迁移 | 当前实现，因 SQLite 约束与原 TypeDORM 名称不同 |
 | 前端 | React + Radix UI | 交互基础与自定义深色科技风格 | 已明确方向 |
 | MCP | 官方 TypeScript SDK v2 | Client 与 Server 双角色 | 已明确方向，实施时锁定具体版本 |
@@ -182,7 +182,7 @@ Responses、Chat Completions、Anthropic Messages与Gemini使用统一消息/内
 | 统一事件时间线 | 理解完整工作过程 | 消息、工具、压缩、分支、模型切换与成果统一关联 | 高 |
 | 项目聚合 | 同一项目可能跨多个目录和 Agent | 仓库、worktree、工作目录、远端标识与人工绑定 | 中 |
 | 请求与会话关联 | 把费用和错误定位到具体任务 | 优先显式 ID；推断关联标明依据和置信度 | 高 |
-| 搜索与恢复 | 找回过去决策并继续工作 | 全文索引、来源定位、原生恢复与交接包 | 中至高 |
+| 搜索与恢复 | 找回过去决策并继续工作 | 后台原文件搜索、字节定位、原生恢复与交接包 | 中至高 |
 | 采集完整度 | 避免把缺失数据误认为没有活动 | 展示发现、解析、同步、受限、未知和过期状态 | 中 |
 
 Session 保留原生身份和来源。归一化事件保留原始事件引用、解析器版本及字段缺失原因；未知内容不能补写成已发生事实。
@@ -554,6 +554,10 @@ Effect 管理依赖、资源释放、取消、超时、重试和并发。持久�
 | 治理 | CredentialRef、Approval、AuditEvent、BackgroundJob、ConfigSnapshot、Device |
 | 运行控制 | LaunchProfile、ManagedAgentHome、RunGoal、RunCheckpoint、ControlEvent、RunLease |
 
+会话存储遵循 filesystem-first：原生 JSONL 是正文来源，读取和搜索在授权范围内按需打开文件，增量扫描只持久化身份、游标、事件偏移、分支关系等定位信息。SQLite 不重复保存会话正文，也不建立复制正文的 FTS 索引。搜索通过独立 Worker 的持久任务执行，显示扫描进度、支持取消；源文件缺失或变更时明确显示覆盖缺口。偏好仅保存确认所需的短证据，不复制完整会话。实现难度中等，重点是字节边界、文件改写检测、权限撤销及证据可追溯。
+
+旧版重复正文和 FTS 使用显式停服维护回收：取得同一数据库的运行归属锁，核对源文件身份和已索引前缀哈希，清除可重建副本并 VACUUM；源文件缺失、改变或授权停用时保留旧正文，避免丢失唯一副本。服务运行中拒绝压缩，避免长时间持有 SQLite 写锁拖住代理和调度。请求正文留存属于独立的可观测性数据，应与可重建的文件索引分开管理，并设置容量与期限。
+
 逻辑对象随实际功能形成表和索引。原始大文件、附件和可选正文快照存受控内容目录，SQLite 保存权限、引用、索引和内容身份。运行状态持久化记录轮次、预算、唤醒条件、最近进展和原生会话身份，配置实例与会话留存分开管理。
 
 费用同时保留上游 usage、计价版本及计算结果，金额采用确定精度。由会话导入和代理观察获得的同一次消耗需要关联去重，未知 usage 与零消耗分别展示。
@@ -773,3 +777,15 @@ T 与 H 组来源核对日期为 2026-09-18；新增的 A、C、P 组来源核�
 | C3 | Codex Non-interactive mode | `https://developers.openai.com/codex/noninteractive/` |
 | P1 | Pi RPC | `https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/rpc.md` |
 | P2 | Pi custom models | `https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/models.md` |
+
+### 9.6 请求可观测性
+
+普通模型请求至少保存可定位的元数据：请求组、客户端、协议、模型别名、目标 Provider、路由决策、重试尝试、状态、首字节、总延迟、Token、费用、响应 ID 和错误。正文采集默认开启，用户可以关闭；正文与元数据分开保留，均使用本地加密和期限/容量策略。
+
+正文轨迹拆成 request、effective、upstream、response、output 五个阶段。网关协议转换必须同时展示转换前的上游内容和转换后的输出；流式请求按块异步落盘，允许查看原始 SSE 和转换结果；同一 route session 的请求按顺序关联并提供 effective diff。大请求按分片分页读取，只有用户打开正文查看或 Diff 时才在前端解析结构。所有正文采用本地加密、分阶段大小限制、总容量上限和过期清理。
+
+实现方式：代理线程只发送带序列号的完整事件到 Trace Worker，Worker 串行短事务写入 SQLite，队列满时记录 partial 而不是阻塞模型调用。请求头、Cookie、凭据字段和 URL 参数按原样进入加密记录；脱敏与脱敏映射是独立的查看/导出功能，不修改事实记录。删除、过期和容量淘汰删除正文分片但保留最小状态。难度中高，风险集中在流式背压、取消收尾、加密访问边界和存储配额。
+
+## Agent Trajectory 定义修订
+
+Agent 可观测性按 `docs/agent-trajectory.md` 实施：会话 → 轮次 → 步骤 → 上下文快照 → 模型/工具因果轨迹，三栏浏览与统一 Inspector。旧“混合事件列表 + 全库快照”不再作为该能力的交付标准；快照 Diff 指步骤级上下文、工具、路由与运行状态的语义变化。以 T01–T15 逐项证据判定完成。

@@ -1,7 +1,8 @@
 import type { Database } from "bun:sqlite";
-import { db, PreferenceSchema, PreferenceRevisionSchema, EvidenceSchema, SessionEventSchema, SourceSchema, record, audit } from "./store";
+import { db, PreferenceSchema, PreferenceRevisionSchema, EvidenceSchema, SessionSchema, SessionEventSchema, SourceSchema, record, audit } from "./store";
 import { atomic } from "./transactions";
 import { ApiError, hash } from "./security";
+import { readSessionEvents } from "./session-files";
 import { redact } from "./session-parser";
 import type { Preference, PreferenceEvidence, SessionEvent } from "../shared/types";
 
@@ -85,12 +86,24 @@ export function learnFromEvent(database: Database, event: SessionEvent, sourceId
   database.query('INSERT INTO preference_evidence(id,createdAt,updatedAt,preferenceId,eventId,sourceId,sessionId,excerpt,kind,confidence) VALUES(?,?,?,?,?,?,?,?,?,?)')
     .run(evidence.id, evidence.createdAt, evidence.updatedAt, id, event.id, sourceId, event.sessionId, content, 'inferred', 0.65);
 }
+async function readEvidence(eventId: string) {
+  const event = await db.getRepository(SessionEventSchema).findOneBy({ id: eventId });
+  const session = event ? await db.getRepository(SessionSchema).findOneBy({ id: event.sessionId }) : null;
+  const source = session?.sourceId ? await db.getRepository(SourceSchema).findOneBy({ id: session.sourceId }) : null;
+  if (!event || !session || !source?.enabled || !source.captureBodies || !source.learn || event.origin !== "user" || event.kind !== "message") throw new ApiError(403, "evidence_not_authorized");
+  const [loaded] = await readSessionEvents(session, source, [event]);
+  if (!loaded.text) throw new ApiError(403, "evidence_not_authorized");
+  return { ...loaded, text: loaded.text, sourceId: source.id, project: session.project, sourceRevision: source.revision };
+}
+function authorizeEvidence(database: Database, event: Awaited<ReturnType<typeof readEvidence>>) {
+  if (!database.query("SELECT e.id FROM session_events e JOIN sessions s ON s.id=e.sessionId JOIN collection_sources c ON c.id=s.sourceId WHERE e.id=? AND e.generation=? AND c.id=? AND c.revision=? AND c.enabled=1 AND c.captureBodies=1 AND c.learn=1").get(event.id, event.generation, event.sourceId, event.sourceRevision)) throw new ApiError(403, "evidence_not_authorized");
+}
 export async function addEventEvidence(id: string, eventId: string, kind: PreferenceEvidence["kind"]) {
+  const event = await readEvidence(eventId);
   return atomic(database => {
     const preference = database.query('SELECT * FROM preferences WHERE id=?').get(id) as Preference | null;
     if (!preference) throw new ApiError(404, "preference_not_found");
-    const event = database.query('SELECT e.*,s.sourceId FROM session_events e JOIN sessions s ON s.id=e.sessionId JOIN collection_sources c ON c.id=s.sourceId WHERE e.id=? AND c.captureBodies=1 AND c.learn=1 AND c.enabled=1').get(eventId) as SessionEvent & { sourceId: string } | null;
-    if (!event?.text || event.origin !== "user" || event.kind !== "message") throw new ApiError(403, "evidence_not_authorized");
+    authorizeEvidence(database, event);
     const entry = { ...record(), preferenceId: id, eventId, sourceId: event.sourceId, sessionId: event.sessionId, excerpt: event.text.slice(0, 3000), kind, confidence: kind === "inferred" ? 0.65 : 1 };
     database.query('INSERT INTO preference_evidence(id,createdAt,updatedAt,preferenceId,eventId,sourceId,sessionId,excerpt,kind,confidence) VALUES(?,?,?,?,?,?,?,?,?,?)')
       .run(entry.id, entry.createdAt, entry.updatedAt, id, eventId, entry.sourceId, entry.sessionId, entry.excerpt, kind, entry.confidence);
@@ -106,9 +119,9 @@ export async function habitTimeline() {
   return { revisions, counts };
 }
 export async function sourcePreference(input: { eventId: string; title?: string; scope: "global" | "project" }) {
+  const event = await readEvidence(input.eventId);
   return atomic(database => {
-    const event = database.query('SELECT e.*,s.project,s.sourceId FROM session_events e JOIN sessions s ON s.id=e.sessionId JOIN collection_sources c ON c.id=s.sourceId WHERE e.id=? AND c.captureBodies=1 AND c.learn=1').get(input.eventId) as SessionEvent & { project: string | null; sourceId: string } | null;
-    if (!event?.text || event.origin !== "user" || event.kind !== "message") throw new ApiError(403, "evidence_not_authorized");
+    authorizeEvidence(database, event);
     if (input.scope === "project" && !event.project) throw new ApiError(400, "project_required");
     const preference: Preference = { ...record(), title: input.title || event.text.replace(/\s+/g, " ").slice(0, 60), content: event.text.slice(0, 3000), scope: input.scope, project: input.scope === "global" ? null : event.project, source: "session", evidence: event.id, revision: 1, status: "candidate" };
     writePreference(database, preference); revisionRow(database, preference, "user_selected_evidence");

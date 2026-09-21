@@ -23,7 +23,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
         if(["failed","cancelled","uncertain"].includes(job.status))throw new RequestError(job.error||job.status,409);
       }
     }finally{
-      if(options.signal?.aborted&&body.job.kind==="sessions.search")void fetch(`/api/jobs/${id}/cancel`,{method:"POST",headers:{"content-type":"application/json"}}).catch(()=>{});
+      if(options.signal?.aborted&&["sessions.search","sessions.timeline","assets.search"].includes(body.job.kind))void fetch(`/api/jobs/${id}/cancel`,{method:"POST",headers:{"content-type":"application/json"}}).catch(()=>{});
     }
   }
   return body;
@@ -56,7 +56,10 @@ export function useResource<T>(path: string, interval = 0) {
   return { data, error, loading, refresh };
 }
 export const errors: Record<string, I18nKey> = {
+  snapshot_expired:"error.snapshotExpired",snapshot_not_ready:"error.snapshotNotReady",snapshot_body_missing:"error.snapshotBodyMissing",snapshot_source_active:"error.snapshotSourceActive",snapshot_storage_limit:"error.snapshotStorageLimit",snapshot_file_changed:"error.snapshotChanged",snapshot_file_missing:"error.snapshotChanged",snapshot_scope_mismatch:"error.snapshotScope",snapshot_too_large:"error.snapshotTooLarge",snapshot_context_required:"error.snapshotContext",
+  target_not_skill:"error.targetNotSkill",asset_source_disabled:"error.assetDisabled",package_size_limit:"error.packageSize",package_directory_limit:"error.packageSize",package_symlink_requires_review:"error.packageLink",package_hardlink_requires_review:"error.packageLink",target_changed:"error.targetChanged",target_root_missing:"error.targetRootMissing",invalid_skill_directory:"error.skillDirectory",deployment_state_changed:"error.deploymentState",
   budget_exhausted: "error.budget", token_budget_exhausted: "error.tokens", price_required: "error.prices", concurrency_limit: "error.concurrency", run_not_active: "error.runEnded", extend_limits_required: "error.extendLimits", agent_not_installed: "error.agentMissing", invalid_workspace: "error.workspaceMissing", approval_expired: "error.approvalExpired", steering_not_supported: "error.steering", run_not_resumable: "error.resume",
+  session_file_missing:"error.sessionFileMissing",session_file_changed:"error.sessionFileChanged",source_path_escape:"error.sourceChanged",
   source_overlap: "error.sourceOverlap", source_missing: "error.directoryMissing", source_exists: "error.sourceExists", source_changed: "error.sourceChanged", pause_source_before_moving: "error.pauseSource", capture_required: "error.captureRequired", source_too_broad: "error.sourceBroad", absolute_path_required: "error.absolutePath", evidence_not_authorized: "error.evidenceScope",
   catalog_changed: "error.catalogChanged", upstream_catalog_changed: "error.upstreamCatalog", mcp_scope_denied: "error.mcpScope", invalid_tool_arguments: "error.toolArguments", mcp_disabled: "error.mcpDisabled", call_not_active: "error.callEnded", mcp_concurrency_limit: "error.toolConcurrency", tool_rejected: "error.toolRejected",
   invalid_token: "error.credentials", invalid_input: "error.input", provider_in_use: "error.providerUsed", protocol_mismatch: "error.protocol",

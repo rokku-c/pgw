@@ -81,7 +81,7 @@ async function execute(control: ActiveRun, message?: string) {
     const route = await db.getRepository(RouteSchema).findOneBy({ id: run.routeId, enabled: true });
     if (!route) throw new ApiError(409, "route_unavailable");
     const key = newClientKey();
-    const client = await db.getRepository(ClientSchema).save({ ...record(), name: `${run.agent}:${run.id.slice(0, 8)}`, keyHash: hash(key),
+    const client = await db.getRepository(ClientSchema).save({ ...record(), name: `${run.agent}:${run.id.slice(0, 8)}`, kind: "temporary", keyHash: hash(key),
       keyPreview: `${key.slice(0, 8)}…${key.slice(-4)}`, enabled: true, project: run.workspace, personalize: true, routeIds: [route.id], lastUsedAt: null,
       mcpGrants: run.controls.mcpGrants || [], memoryAccess: run.controls.memoryAccess || false, budgetMicros: run.controls.budgetMicros, tokenLimit: run.controls.tokenLimit, maxConcurrent: 4, runId: run.id, expiresAt: Date.now() + remaining });
     clientId = client.id;
@@ -187,6 +187,7 @@ export async function stopRun(id: string, paused = false) {
   if (!control) {
     const run = await getRun(id);
     if (["completed", "cancelled", "failed"].includes(run.status)) throw new ApiError(409, "run_not_active");
+    if (run.clientId) { await db.getRepository(ClientSchema).update(run.clientId, { enabled: false, updatedAt: Date.now() }); await revokeMcpAccess({ clientId: run.clientId }); }
     await update(run, { status: paused ? "paused" : "cancelled", stopReason: paused ? "user_paused" : "user_cancelled", endedAt: Date.now() });
     await event(run, `run.${run.status}`); return { ok: true };
   }

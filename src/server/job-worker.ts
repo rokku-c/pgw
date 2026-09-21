@@ -3,8 +3,9 @@ import { decrypt, encrypt, ApiError } from "./security";
 import { atomic } from "./transactions";
 import { jobContext, RetryScheduled } from "./job-context";
 import { scanRegistry } from "./collector";
-import { scanSessions, listSessions } from "./sessions";
+import { scanSessions, listSessions, timeline } from "./sessions";
 import { probeProvider } from "./providers";
+import { scanAssets,searchSkills,inspectAsset,snapshotAsset,snapshotDetail,previewDeployment,applyDeployment } from "./assets";
 import { probeMcp, executeMcp } from "./mcp";
 
 await db.initialize();
@@ -19,11 +20,21 @@ let running: {id:string;cancel:()=>void}|undefined;
     const input=JSON.parse(decrypt(job.payloadCipher));
     await context.context.check();
     let result:unknown;
-    if(job.kind==="registry.scan")result=await scanRegistry(context.context);
+    if(job.kind==="trajectory.snapshot")result=await (await import("./trajectory-snapshots")).createContextSnapshot(input,id,context.context);
+    else if(job.kind==="trajectory.cleanup")result=await (await import("./trajectory-snapshots")).sweepContextSnapshots(context.context);
+    else if(job.kind==="assets.scan")result=await scanAssets(input.rootId,context.context);
+    else if(job.kind==="assets.search")result=await searchSkills(input);
+    else if(job.kind==="assets.inspect")result=input.snapshotId?await snapshotDetail(input.snapshotId):await inspectAsset(input.id,context.context);
+    else if(job.kind==="assets.snapshot")result=await snapshotAsset(input.id,context.context);
+    else if(job.kind==="assets.preview")result=await previewDeployment(input,context.context);
+    else if(job.kind==="assets.apply"||job.kind==="assets.restore")result=await applyDeployment(input.id,job.kind==="assets.restore",context.context);
+    else if(job.kind==="registry.scan")result=await scanRegistry(context.context);
     else if(job.kind==="sessions.scan")result=await scanSessions(input.sourceId,context.context);
     else if(job.kind==="sessions.search"){
       await context.context.progress("search",0,null);
-      const page=await listSessions(input);result={ids:page.items.map(s=>s.id),total:page.total,next:page.next};
+      const page=await listSessions(input,context.context);result={ids:page.items.map(s=>s.id),total:page.total,next:page.next,unavailable:page.unavailable};
+    }else if(job.kind==="sessions.timeline"){
+      result=await timeline(input.id,input.options,context.context,false);
     }else if(job.kind==="provider.probe"){
       const provider=await db.getRepository(ProviderSchema).findOneBy({id:input.id});if(!provider)throw new ApiError(404,"provider_not_found");
       await context.context.progress("connect",0,1,provider.name);result=await probeProvider(provider);
@@ -45,6 +56,7 @@ let running: {id:string;cancel:()=>void}|undefined;
     if(error instanceof RetryScheduled)return;
     const job=await db.getRepository(JobSchema).findOneBy({id});
     const code=error instanceof ApiError?error.code:error instanceof Error?error.message.slice(0,160):"job_failed";
-    await db.getRepository(JobSchema).update(id,{status:context.context.signal.aborted||code==="job_cancelled"?(job?.kind==="mcp.debug"?"uncertain":"cancelled"):"failed",phase:"stopped",error:code,endedAt:Date.now(),updatedAt:Date.now()});
+    if(job?.kind==="trajectory.snapshot"&&(context.context.signal.aborted||code==="job_cancelled"))await (await import("./trajectory-snapshots")).deleteContextSnapshot(id).catch(()=>{});
+    await db.getRepository(JobSchema).update(id,{status:context.context.signal.aborted||code==="job_cancelled"?(job&&["mcp.debug","assets.apply","assets.restore"].includes(job.kind)?"uncertain":"cancelled"):"failed",phase:"stopped",error:code,endedAt:Date.now(),updatedAt:Date.now()});
   }finally{context.close();running=undefined;(globalThis as any).postMessage({type:"done",id});}
 };

@@ -7,7 +7,7 @@
     "pgw": "./src/cli.ts"
   },
   "scripts": {
-    "dev": "NODE_ENV=development bun --hot src/server/index.ts",
+    "dev": "NODE_ENV=development bun src/server/index.ts",
     "start": "bun src/server/index.ts",
     "build": "bun scripts/build.ts",
     "check": "tsc --noEmit",

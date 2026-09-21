@@ -18,7 +18,7 @@ export async function executeModelDebug(jobId:string,raw:unknown,context:WorkCon
   const input=debugInput.parse(raw);
   const route=await db.getRepository(RouteSchema).findOneBy({id:input.routeId,enabled:true});if(!route)throw new ApiError(404,"route_not_found");
   const key=newClientKey();
-  const client=await db.getRepository(ClientSchema).save({...record(),name:`Debug ${jobId.slice(0,8)}`,keyHash:hash(key),keyPreview:`${key.slice(0,8)}…${key.slice(-4)}`,enabled:true,project:input.project,personalize:input.personalize,routeIds:[route.id],lastUsedAt:null,budgetMicros:null,tokenLimit:null,maxConcurrent:1,runId:null,expiresAt:null,mcpGrants:[],memoryAccess:false});
+  const client=await db.getRepository(ClientSchema).save({...record(),name:`Debug ${jobId.slice(0,8)}`,kind:"temporary",keyHash:hash(key),keyPreview:`${key.slice(0,8)}…${key.slice(-4)}`,enabled:true,project:input.project,personalize:input.personalize,routeIds:[route.id],lastUsedAt:null,budgetMicros:null,tokenLimit:null,maxConcurrent:1,runId:null,expiresAt:Date.now()+24*60*60*1000,mcpGrants:[],memoryAccess:false});
   const [previous]=await db.query("SELECT coalesce(max(number),0) number FROM debug_attempts WHERE jobId=?",[jobId]);
   try{
     for(let attempt=Number(previous.number)+1;input.retry.maxAttempts===null||attempt<=input.retry.maxAttempts;attempt++){

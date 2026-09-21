@@ -6,6 +6,7 @@ import { Tooltip } from "radix-ui";
 import { SquaresFourIcon, HexagonIcon, PulseIcon, ChatCircleTextIcon, StackIcon, FingerprintIcon, PlayCircleIcon, SlidersHorizontalIcon, ArrowUpRightIcon, ArrowRightIcon, PlusIcon, CommandIcon, CircleIcon, SignOutIcon, ListIcon, XIcon, LightningIcon, CheckIcon, ShieldCheckIcon, MagnifyingGlassIcon } from "@phosphor-icons/react";
 import { api, useResource } from "./api";
 import { Button, IconButton, Modal, Field, Loading } from "./components";
+import { TrajectoryWorkbench } from "./trajectory-workbench";
 import { JobsPage, JobIndicator } from "./jobs";
 import { PlaygroundPage } from "./playground";
 import { Overview, Models, TrafficPage, SessionsPage, RegistryPage, PersonaPage, SettingsPage, RunsPage } from "./pages";
@@ -21,6 +22,7 @@ const navigation: { id: Page; label: I18nKey; icon: typeof SquaresFourIcon; key:
   { id: "overview", label: "nav.overview", icon: SquaresFourIcon, key: "1" },
   { id: "models", label: "nav.models", icon: HexagonIcon, key: "2" },
   { id: "traffic", label: "nav.traffic", icon: PulseIcon, key: "3" },
+  { id: "observability", label: "nav.observability", icon: PulseIcon, key: "10" },
   { id: "sessions", label: "nav.sessions", icon: ChatCircleTextIcon, key: "4" },
   { id: "registry", label: "nav.registry", icon: StackIcon, key: "5" },
   { id: "persona", label: "nav.persona", icon: FingerprintIcon, key: "6" },
@@ -40,7 +42,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  return <div className="login-shell"><div className="login-orbit"/><form className="login-card" onSubmit={async event => { event.preventDefault(); setBusy(true); try { await api("/auth/session", { method: "POST", body: JSON.stringify({ token }) }); onLogin(); } catch { setError("error.credentials"); } finally { setBusy(false); } }}><div className="login-brand"><LanguageSwitch/><Logo/><span>{t("brand.name")} {t("brand.sub")}</span></div><h1>{t("login.title")}</h1><Field label={t("login.token")}><input type="password" autoFocus autoComplete="off" value={token} onChange={e => setToken(e.target.value)} required/></Field>{error && <div role="alert" className="form-error">{trError(error)}</div>}<Button className="primary login-submit" busy={busy} type="submit">{t("login.connect")}<ArrowRightIcon size={18}/></Button><div className="login-foot"><ShieldCheckIcon size={15}/> {t("login.local")}</div></form></div>;
+  return <div className="login-shell"><div className="login-orbit"/><form className="login-card" onSubmit={async event => { event.preventDefault(); setBusy(true); try { await api("/auth/session", { method: "POST", body: JSON.stringify({ token: token.trim() }) }); onLogin(); } catch { setError("error.credentials"); } finally { setBusy(false); } }}><div className="login-brand"><LanguageSwitch/><Logo/><span>{t("brand.name")} {t("brand.sub")}</span></div><h1>{t("login.title")}</h1><Field label={t("login.token")}><input type="password" autoFocus autoComplete="off" value={token} onChange={e => setToken(e.target.value)} required/></Field>{error && <div role="alert" className="form-error">{trError(error)}</div>}<Button className="primary login-submit" busy={busy} type="submit">{t("login.connect")}<ArrowRightIcon size={18}/></Button><div className="login-foot"><ShieldCheckIcon size={15}/> {t("login.local")}</div></form></div>;
 }
 function App() {
   const { t } = useI18n();
@@ -79,7 +81,7 @@ function App() {
       <div className="sidebar-bottom"><button className="search-launch" onClick={() => setCommandOpen(true)}><MagnifyingGlassIcon size={17}/><span>{t("nav.search")}</span><kbd>⌘ K</kbd></button><a href="/app/settings" className={`nav-item ${page === "settings" ? "active" : ""}`} onClick={event => { event.preventDefault(); navigate("settings"); }}><SlidersHorizontalIcon size={20} weight="light"/><span>{t("nav.settings")}</span></a><ConnectionState/></div>
     </aside>
     <main className="main"><header className="topbar"><div className="breadcrumb"><IconButton label={tr("nav.toggle")} className="mobile-menu" onClick={() => setMobile(true)}><ListIcon size={20}/></IconButton><span>{t("nav.workspace")}</span><span className="slash">/</span><strong>{t(current.label)}</strong></div><div className="topbar-right"><LanguageSwitch/><JobIndicator open={()=>navigate("jobs")}/><span className="local-badge"><ShieldCheckIcon size={14}/> {t("status.local")}</span><button className="avatar" onClick={() => navigate("settings")} aria-label={t("nav.settings")}>P</button></div></header><div className="page" key={current.id}>
-      {current.id === "jobs" && <JobsPage/>}{current.id === "playground" && <PlaygroundPage/>}{current.id === "overview" && <Overview navigate={navigate}/>}{current.id === "models" && <Models/>}{current.id === "traffic" && <TrafficPage/>}{current.id === "sessions" && <SessionsPage/>}{current.id === "registry" && <RegistryPage/>}{current.id === "persona" && <PersonaPage/>}{current.id === "runs" && <RunsPage/>}{current.id === "settings" && <SettingsPage/>}
+      {current.id === "jobs" && <JobsPage/>}{current.id === "playground" && <PlaygroundPage/>}{current.id === "overview" && <Overview navigate={navigate}/>}{current.id === "models" && <Models/>}{current.id === "traffic" && <TrafficPage/>}{current.id === "observability" && <TrajectoryWorkbench/>}{current.id === "sessions" && <SessionsPage/>}{current.id === "registry" && <RegistryPage/>}{current.id === "persona" && <PersonaPage/>}{current.id === "runs" && <RunsPage/>}{current.id === "settings" && <SettingsPage/>}
     </div><footer className="footer"><span><span className="tiny-dot"/> {t("footer.brand")}</span><span>{t("footer.local")}</span></footer></main>
     <Modal title={t("nav.search")} open={commandOpen} onOpenChange={setCommandOpen}><div className="command-search"><MagnifyingGlassIcon size={20}/><input autoFocus aria-label={t("nav.search")} placeholder={t("common.search")} value={query} onChange={e => setQuery(e.target.value)}/></div><div className="command-items">{navigation.filter(n => t(n.label).toLowerCase().includes(query.toLowerCase()) || n.id.includes(query.toLowerCase())).map(n => <button key={n.id} onClick={() => navigate(n.id)}><n.icon size={20} weight="light"/><span>{t(n.label)}</span><kbd>⌘ {n.key}</kbd></button>)}</div></Modal>
   </div>;

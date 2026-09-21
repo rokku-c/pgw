@@ -47,7 +47,11 @@ export function requireAdmin(request: Request) {
   if (!isAdmin(request)) throw new ApiError(401, "unauthorized");
   if (!["GET", "HEAD"].includes(request.method) && !bearer(request) && !request.headers.get("origin")) throw new ApiError(403, "origin_required");
 }
-export async function readJson(request: Request, maxBytes = 1_048_576) {
+const bodySizes = new WeakMap<Request, number>();
+const rawBodies = new WeakMap<Request, Uint8Array>();
+export const requestBodyBytes = (request: Request) => rawBodies.get(request);
+export const requestBodySize = (request: Request) => bodySizes.get(request) || 0;
+export async function readJson(request: Request, maxBytes = 1_048_576, retainRaw = false) {
   if (!request.headers.get("content-type")?.includes("application/json")) throw new ApiError(415, "json_required");
   if (Number(request.headers.get("content-length")) > maxBytes) throw new ApiError(413, "body_too_large");
   if (!request.body) throw new ApiError(400, "body_required");
@@ -62,7 +66,10 @@ export async function readJson(request: Request, maxBytes = 1_048_576) {
       if (size > maxBytes) { await reader.cancel(); throw new ApiError(413, "body_too_large"); }
       chunks.push(value);
     }
-    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    bodySizes.set(request, size);
+    const bytes = Buffer.concat(chunks);
+    if (retainRaw) rawBodies.set(request, bytes);
+    return JSON.parse(bytes.toString("utf8"));
   } catch (error) {
     if (error instanceof ApiError) throw error;
     throw new ApiError(400, "invalid_json");
