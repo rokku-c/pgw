@@ -137,7 +137,7 @@ export async function proxy(request:Request):Promise<Response> {
       decisions.push({action:circuit.allowed?"select":"skip",target:provider.id,reason:session?.providerId?`session_pinned:${circuit.reason}`:circuit.reason});
       if(!circuit.allowed){ lastError=new ApiError(503,"circuit_open");continue; }
       const started=Date.now();
-      const traffic:Traffic={...record(),clientId:client.id,clientName:client.name,routeId:route.id,model:route.alias,providerId:provider.id,providerName:provider.name,protocol,status:"running",upstreamStatus:null,latencyMs:null,firstByteMs:null,firstTokenMs:null,decodingMs:null,...emptyUsage(),costMicros:null,error:null,stream:!!body.stream,project:client.project,patchIds:prefs.map(p=>`${p.id}:${p.revision}`),runId:client.runId,accounting:"pending",pricing:{input:route.inputPrice,output:route.outputPrice,cacheRead:route.cacheReadPrice,cacheWrite:route.cacheWritePrice,cacheWriteLong:route.cacheWriteLongPrice},requestGroupId:group,affinityId:session?.id||null,responseId:null,decisions:[...decisions]};
+      const traffic:Traffic={...record(),clientId:client.id,clientName:client.name,routeId:route.id,model:route.alias,providerId:provider.id,providerName:provider.name,protocol,status:"running",upstreamStatus:null,latencyMs:null,firstByteMs:null,firstTokenMs:null,decodingMs:null,...emptyUsage(),costMicros:null,error:null,stream:!!body.stream,project:client.project,patchIds:prefs.map(p=>`${p.id}:${p.revision}`),runId:client.runId,accounting:"pending",pricing:{input:route.inputPrice,output:route.outputPrice,cacheRead:route.cacheReadPrice,cacheWrite:route.cacheWritePrice,cacheWriteLong:route.cacheWriteLongPrice},requestGroupId:group,affinityId:session?.id||null,responseId:null,decisions:[...decisions],bytesTotal:0,progressAt:null};
       let capture:RequestCapture = { json(){}, chunk(){}, metadata(){}, secret(){}, finish(){} };
       try{ await reserveBudget(traffic.id,client,route,outputTokens,{key:`${route.id}:${target.providerId}:${target.model}`,maxConcurrent:target.maxConcurrent}); await db.getRepository(TrafficSchema).save(traffic);
         await recordCallContext(traffic,context);
@@ -150,13 +150,19 @@ export async function proxy(request:Request):Promise<Response> {
       const touch=()=>{clearTimeout(idleTimer);idleTimer=setTimeout(()=>controller.abort(new Error("upstream_idle_timeout")),60000);};touch();
       const timeout=setTimeout(()=>controller.abort(new Error("upstream_timeout")),300000);
       let submitted=false,rejected=true,terminal=false,responseStatus="unknown",usage=emptyUsage(),failure:string|null=null;
+      // 进行中的实时进度：每 500ms 落一次已耗时/已写字节/当前 token。
+      // 首字节到达前没有任何写入钩子，正是「等待时长看不到」的直接原因，这个定时器覆盖那段。
+      let bytesTotal=0;
+      const progressTimer=setInterval(()=>{
+        void db.getRepository(TrafficSchema).update(traffic.id,{latencyMs:Date.now()-started,firstByteMs:traffic.firstByteMs,firstTokenMs:traffic.firstTokenMs,bytesTotal,inputTokens:usage.inputTokens,outputTokens:usage.outputTokens,progressAt:Date.now()}).catch(()=>{});
+      },500);
       let finishPromise:Promise<void>|undefined;
       const cancel=()=>controller.abort(new Error("client_cancelled"));
       request.signal.addEventListener("abort",cancel,{once:true});
       const finish=(status:Traffic["status"],error:string|null=null):Promise<void>=>{
         if(finishPromise)return finishPromise;
         finishPromise=(async()=>{
-          clearTimeout(timeout);clearTimeout(idleTimer);request.signal.removeEventListener("abort",cancel);controller.signal.removeEventListener("abort",aborted);
+          clearInterval(progressTimer);clearTimeout(timeout);clearTimeout(idleTimer);request.signal.removeEventListener("abort",cancel);controller.signal.removeEventListener("abort",aborted);
           // 响应方向的丢弃在这里统一落库：finishPromise 保证只跑一次，覆盖正常结束、上游错误、流内异常与客户端取消。
           const flushed=sink.dropped.length>0;
           if(flushed)traffic.decisions.push(...dropDecisions(sink,provider.id));
@@ -170,7 +176,7 @@ export async function proxy(request:Request):Promise<Response> {
           await settleBudget(traffic.id,terminal&&status==="completed"?traffic:{inputTokens:null,outputTokens:null,costMicros:null},knownRejected);
           if(terminal && protocol==="responses" && upstreamWire==="responses" && traffic.responseId)await recordResponse(session,traffic.responseId,target,provider,responseStatus,group);
           if(knownRejected)await unpinRejectedRoute(session,group);
-          await db.getRepository(TrafficSchema).update(traffic.id,{status,error,latencyMs:Date.now()-started,firstByteMs:traffic.firstByteMs,firstTokenMs:traffic.firstTokenMs,decodingMs:traffic.decodingMs,upstreamStatus:traffic.upstreamStatus,inputTokens:traffic.inputTokens,outputTokens:traffic.outputTokens,cacheReadTokens:traffic.cacheReadTokens,cacheWriteTokens:traffic.cacheWriteTokens,cacheWriteLongTokens:traffic.cacheWriteLongTokens,reasoningTokens:traffic.reasoningTokens,costMicros:traffic.costMicros,accounting:traffic.accounting,responseId:traffic.responseId,...(flushed?{decisions:traffic.decisions}:{}),updatedAt:Date.now()});
+          await db.getRepository(TrafficSchema).update(traffic.id,{status,error,latencyMs:Date.now()-started,firstByteMs:traffic.firstByteMs,firstTokenMs:traffic.firstTokenMs,decodingMs:traffic.decodingMs,upstreamStatus:traffic.upstreamStatus,inputTokens:traffic.inputTokens,outputTokens:traffic.outputTokens,cacheReadTokens:traffic.cacheReadTokens,cacheWriteTokens:traffic.cacheWriteTokens,cacheWriteLongTokens:traffic.cacheWriteLongTokens,reasoningTokens:traffic.reasoningTokens,costMicros:traffic.costMicros,accounting:traffic.accounting,responseId:traffic.responseId,bytesTotal,progressAt:Date.now(),...(flushed?{decisions:traffic.decisions}:{}),updatedAt:Date.now()});
           capture.finish(status,error);
           const upstreamFailure=error && error!=="client_cancelled" && ![400,401,403,404,413,422].includes(traffic.upstreamStatus||0)?error:null;
           await recordAdaptiveObservation(traffic,provider,target.model,protocol,error);
@@ -213,7 +219,7 @@ export async function proxy(request:Request):Promise<Response> {
         if(!body.stream){
           if(!response.body)throw new ApiError(502,"empty_upstream_response");
           reader=response.body.getReader();const chunks:Uint8Array[]=[];let size=0;
-          while(true){const next=await reader.read();if(next.done)break;touch();if(traffic.firstByteMs===null)traffic.firstByteMs=Date.now()-started;size+=next.value.length;if(size>32*1024*1024)throw new ApiError(502,"upstream_response_too_large");chunks.push(next.value);}
+          while(true){const next=await reader.read();if(next.done)break;touch();if(traffic.firstByteMs===null)traffic.firstByteMs=Date.now()-started;size+=next.value.length;bytesTotal=size;if(size>32*1024*1024)throw new ApiError(502,"upstream_response_too_large");chunks.push(next.value);}
           const bytes=Buffer.concat(chunks);capture.chunk("response",bytes);const text=bytes.toString("utf8");let parsed:any;
           try{parsed=JSON.parse(text);}catch{throw new ApiError(502,"invalid_upstream_response");}
           if(parsed.error)throw new ApiError(502,"upstream_error_body");
@@ -266,6 +272,7 @@ export async function proxy(request:Request):Promise<Response> {
                   await finish(terminal&&!failure?"completed":"failed",failure||(!terminal?"stream_incomplete":null));await releaseRouteSession(session,group,uncertain);controller.close();return;
                 }
                 touch();if(traffic.firstByteMs===null)traffic.firstByteMs=Date.now()-started;
+                bytesTotal+=next.value.length;
                 capture.chunk("response",next.value);
                 parser.push(next.value);
                 if(!conversion){controller.enqueue(next.value);produced=true;}

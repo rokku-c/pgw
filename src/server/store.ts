@@ -13,7 +13,7 @@ const boolean: EntitySchemaColumnOptions = { type: "boolean" };
 const base = { id: { type: "text", primary: true }, createdAt: integer(), updatedAt: integer() } satisfies Record<string, EntitySchemaColumnOptions>;
 /** 当前 schema 版本。**新增迁移时必须同步改这里** —— 下面的守卫与迁移块若与它脱钩，
  *  库升到新版本后的下一次启动会被守卫误判为"过新的库"而拒绝启动。 */
-const SCHEMA_VERSION = 23;
+const SCHEMA_VERSION = 24;
 function schema<T extends ObjectLiteral>(name: string, columns: Record<string, EntitySchemaColumnOptions>) {
   return new EntitySchema<T>({ name, tableName: name, columns: { ...base, ...columns } as never });
 }
@@ -35,7 +35,7 @@ export const TrafficSchema = schema<Traffic>("traffic", {
   clientId: text(), clientName: text(), routeId: text(), model: text(), providerId: text(), providerName: text(),
   protocol: text(), status: text(), upstreamStatus: integer(true), latencyMs: integer(true), firstByteMs: integer(true), firstTokenMs: integer(true), decodingMs: integer(true),
   inputTokens: integer(true), outputTokens: integer(true), costMicros: integer(true), error: text(true),
-  stream: boolean, project: text(true), patchIds: json, requestGroupId: text(true), affinityId: text(true), responseId: text(true), cacheReadTokens: { ...integer(), default: 0 }, cacheWriteTokens: { ...integer(), default: 0 }, cacheWriteLongTokens: { ...integer(), default: 0 }, reasoningTokens: { ...integer(), default: 0 }, decisions: { ...json, default: '[]' }, runId: text(true), accounting: { ...text(), default: "unknown" }, pricing: { ...json, default: '{"input":null,"output":null}' },
+  stream: boolean, project: text(true), patchIds: json, requestGroupId: text(true), affinityId: text(true), responseId: text(true), cacheReadTokens: { ...integer(), default: 0 }, cacheWriteTokens: { ...integer(), default: 0 }, cacheWriteLongTokens: { ...integer(), default: 0 }, reasoningTokens: { ...integer(), default: 0 }, decisions: { ...json, default: '[]' }, bytesTotal: { ...integer(), default: 0 }, progressAt: integer(true), runId: text(true), accounting: { ...text(), default: "unknown" }, pricing: { ...json, default: '{"input":null,"output":null}' },
 });
 export const PreferenceSchema = schema<Preference>("preferences", {
   title: text(), content: text(), scope: text(), project: text(true), status: text(), source: text(),
@@ -300,6 +300,13 @@ export async function initializeStore() {
     if(!existing.some(c=>c.name==="evictedStages"))await manager.query("ALTER TABLE request_captures ADD COLUMN evictedStages TEXT NOT NULL DEFAULT '[]'");
     await manager.query('CREATE INDEX IF NOT EXISTS captures_state_created ON request_captures(state,createdAt)');
     await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(23,?)',[Date.now()]);
+  });}
+  const [progressVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(progressVersion.version<24){await db.transaction(async manager=>{
+    const existing=await manager.query('PRAGMA table_info(traffic)') as {name:string}[];
+    if(!existing.some(c=>c.name==="bytesTotal"))await manager.query('ALTER TABLE traffic ADD COLUMN bytesTotal INTEGER NOT NULL DEFAULT 0');
+    if(!existing.some(c=>c.name==="progressAt"))await manager.query('ALTER TABLE traffic ADD COLUMN progressAt INTEGER');
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(24,?)',[Date.now()]);
   });}
   await db.query("UPDATE request_captures SET state='partial',reason='gateway_restarted',updatedAt=? WHERE state='recording'",[Date.now()]);
   await db.query("UPDATE asset_deployments SET status='uncertain',error='gateway_restarted',updatedAt=? WHERE status IN ('applying','restoring')",[Date.now()]);

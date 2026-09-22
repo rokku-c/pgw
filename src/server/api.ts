@@ -73,9 +73,12 @@ export async function api(request: Request) {
     const latencyRows=await db.query("SELECT latencyMs FROM traffic WHERE createdAt>=? AND status='completed' AND latencyMs IS NOT NULL ORDER BY latencyMs",[since]) as {latencyMs:number}[];
     const p95LatencyMs=latencyRows.length?latencyRows[Math.min(latencyRows.length-1,Math.floor(latencyRows.length*.95))].latencyMs:null;
     const [toolCounts]=await db.query("SELECT count(*) n FROM mcp_calls WHERE createdAt>=?",[since]);
+    // 实时指标：在途用 budget_reservations 的 held（权威并发计数），吞吐取最近 60s。
+    const [live]=await db.query("SELECT (SELECT count(*) FROM budget_reservations WHERE status='held') active,(SELECT count(DISTINCT coalesce(requestGroupId,id)) FROM traffic WHERE createdAt>=?) qps,(SELECT coalesce(sum(outputTokens),0) FROM traffic WHERE createdAt>=?) tokens",[Date.now()-60000,Date.now()-60000]);
+    const active=Number(live.active||0),qps=Number(live.qps||0)/60,tps=Number(live.tokens||0)/60;
     const series = await db.query(`SELECT strftime('%Y-%m-%dT%H:00:00Z', createdAt / 1000, 'unixepoch') as hour, count(*) as count,
       sum(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed FROM traffic WHERE createdAt >= ? GROUP BY hour`, [since]);
-    const output: Dashboard = { requests: counts.requests, running: counts.running || 0, successRate: counts.requests ? counts.completed / counts.requests : null,
+    const output: Dashboard = { requests: counts.requests, running: counts.running || 0, successRate: counts.requests ? counts.completed / counts.requests : null, active, qps, tps,
       tokens: counts.tokens || 0, inputTokens: counts.inputTokens || 0, outputTokens: counts.outputTokens || 0, reasoningTokens: counts.reasoningTokens || 0, cacheReadTokens: counts.cacheReadTokens || 0, cacheWriteTokens: counts.cacheWriteTokens || 0, costMicros: counts.costMicros || 0, unknownCost: counts.unknownCost || 0, latencyMs: counts.latencyMs, avgFirstTokenMs: counts.avgFirstTokenMs, avgDecodingMs: counts.avgDecodingMs, p95LatencyMs, modelCalls: counts.requests || 0, toolCalls: toolCounts.n || 0, retries: counts.retries || 0,
       series, recent: await db.getRepository(TrafficSchema).find({ order: { createdAt: "DESC" }, take: 8 }),
       events: await db.getRepository(AuditSchema).find({ order: { createdAt: "DESC" }, take: 8 }),

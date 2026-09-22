@@ -38,6 +38,8 @@ export interface Traffic extends RecordBase {
   requestGroupId: string | null; affinityId: string | null; responseId: string | null;
   cacheReadTokens: number; cacheWriteTokens: number; cacheWriteLongTokens: number; reasoningTokens: number;
   decisions: { action: string; target?: string; reason: string }[];
+  /** 进行中的实时进度：已写出字节与最后一次进度落库时间（区别于 finish 才写的终值）。 */
+  bytesTotal: number; progressAt: number | null;
 }
 export interface Preference extends RecordBase {
   title: string; content: string; scope: "global" | "project";
@@ -62,6 +64,8 @@ export interface Audit extends RecordBase {
 }
 export interface Dashboard {
   requests: number; running: number; successRate: number | null;
+  /** 实时：在途请求数（budget_reservations 的 held）与最近 60s 的请求/输出吞吐。 */
+  active: number; qps: number; tps: number;
   tokens: number; inputTokens: number; outputTokens: number; reasoningTokens: number; cacheReadTokens: number; cacheWriteTokens: number; costMicros: number; unknownCost: number; latencyMs: number | null; avgFirstTokenMs: number | null; avgDecodingMs: number | null; p95LatencyMs: number | null; modelCalls: number; toolCalls: number; retries: number;
   series: { hour: string; count: number; failed: number }[];
   recent: Traffic[]; events: Audit[];

@@ -10,6 +10,9 @@ export default {
   "dashboard.noTiming": "无采样",
   "dashboard.retries": "重试",
   "dashboard.reasoning": "推理 Token",
+  "dashboard.active": "在途请求",
+  "dashboard.qps": "请求 QPS",
+  "dashboard.tps": "输出 TPS",
 
   "settings.adaptiveContext": "自适应上下文",
   "settings.adaptiveContextHint": "根据请求和上游反馈学习上下文上限。",
@@ -121,6 +124,7 @@ export default {
   "traffic.stage.output": "输出",
   "traffic.capture.none": "未记录",
   "traffic.capture.empty": "暂无正文",
+  "traffic.live.progress": "进行中 · 已耗时 {elapsed}s · 已写出 {bytes} · {tps} tok/s",
   "settings.observability": "请求可观测性",
   "settings.observabilityHint": "记录新请求的完整正文，可随时关闭。",
   "settings.captureQuota": "抓取存储",

@@ -11,6 +11,9 @@ const messages = {
   "dashboard.noTiming": "No timing sample",
   "dashboard.retries": "Retries",
   "dashboard.reasoning": "reasoning tokens",
+  "dashboard.active": "In flight",
+  "dashboard.qps": "Request QPS",
+  "dashboard.tps": "Output TPS",
 
   "settings.adaptiveContext": "Adaptive context",
   "settings.adaptiveContextHint": "Learn context limits from requests and upstream feedback.",
@@ -122,6 +125,7 @@ const messages = {
   "traffic.stage.output": "Output",
   "traffic.capture.none": "Not captured",
   "traffic.capture.empty": "No captured body",
+  "traffic.live.progress": "In flight · {elapsed}s elapsed · {bytes} written · {tps} tok/s",
   "settings.observability": "Request observability",
   "settings.observabilityHint": "Capture complete bodies for new requests; disable anytime.",
   "settings.captureQuota": "Capture storage",
