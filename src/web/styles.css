@@ -29,3 +29,10 @@
 .setting-row small{display:block;margin-top:5px;color:var(--muted);font-size:10px;line-height:1.6}.setting-range{display:flex;align-items:center;gap:10px;min-width:160px}.setting-range input{padding:0;width:130px;accent-color:var(--accent)}.setting-range span{min-width:35px;text-align:right}
 .workbench-range-filters{padding:8px 12px 12px;border-bottom:1px solid var(--line)}.workbench-range-filters label{display:grid;grid-template-columns:60px 1fr 30px;gap:8px;align-items:center;font-size:10px;color:var(--muted);padding:5px 0}.workbench-range-filters input{padding:0;accent-color:var(--accent)}.workbench-range-filters span{text-align:right;font:10px 'Geist Mono Variable',monospace}
 .setting-row-stack{display:block}.setting-row-stack label>span{display:block;margin-bottom:8px}.setting-row-stack textarea{font-size:11px;line-height:1.6}
+
+.storage-total{margin:14px 22px 4px;color:var(--muted);font-size:11px;line-height:1.6}
+.storage-list{display:flex;flex-direction:column}
+.storage-row{display:grid;grid-template-columns:auto minmax(0,1fr) 140px 90px;align-items:center;gap:12px;margin:0 22px;padding:11px 0;border-top:1px solid var(--line);font-size:12px;cursor:pointer}
+.storage-row input{accent-color:var(--accent)}
+.storage-bar{display:block;height:4px;background:rgba(255,255,255,.06);border-radius:2px;overflow:hidden}
+.storage-bar i{display:block;height:100%;background:var(--accent)}

@@ -178,6 +178,9 @@ export interface RetryPolicy { enabled: boolean; maxRetries: number; backoffMs: 
 export interface GatewayPolicies { adaptiveContext: AdaptiveContextPolicy; protocolConversion: boolean; transparentRetry: RetryPolicy }
 export interface CapturePolicy { enabled:boolean; revision:number; retentionDays:number; maxStageBytes:number; maxStorageBytes:number }
 export type CaptureStage = "request" | "effective" | "upstream" | "response" | "output";
+/** 可清理的数据分类；配置类不在此列，界面上不可选中。 */
+export type StorageCategory = "sessions"|"captures"|"snapshots"|"jobs"|"runs"|"assets"|"mcp"|"traffic"|"audit"|"transient";
+export interface StorageUsage { totalBytes:number; configBytes:number; otherBytes:number; categories:{id:StorageCategory;bytes:number}[] }
 export interface CaptureStageUsage { stage:CaptureStage;bytes:number;chunks:number }
 export interface CaptureInfo {
   requestId:string; requestGroupId:string; state:"recording"|"complete"|"partial"|"expired"|"deleted"|"not_captured";

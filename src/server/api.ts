@@ -13,7 +13,8 @@ import { savePreference, removePreference, preferenceHistory, restorePreference,
 import { startRun, stopRun, resumeRun, steerRun, completeRun, decideApproval } from "./runtime";
 import { probeMcp, callMcp, executeMcp, validateGrants, decideMcpCall, cancelMcpCall, publicMcpCall, revokeMcpAccess } from "./mcp";
 import { budgetSummary } from "./budget";
-import { capturePolicy, captureUsage, configureCapture, inspectCapture, captureStage, deleteCapture, deleteAllCaptures, inspectTrajectory, compareTrajectory, trajectorySessions, trajectoryNodes, trajectoryNodeDetail, contextSnapshots, inspectContextSnapshot, compareContextSnapshots, deleteContextSnapshot } from "./observability";
+import { purgeStorage, storageUsage } from "./storage";
+import { capturePolicy, captureUsage, configureCapture, inspectCapture, captureStage, deleteCapture, deleteAllCaptures, clearCaptureStates, inspectTrajectory, compareTrajectory, trajectorySessions, trajectoryNodes, trajectoryNodeDetail, contextSnapshots, inspectContextSnapshot, compareContextSnapshots, deleteContextSnapshot } from "./observability";
 import { adaptivePolicy, retryPolicy, protocolConversionEnabled, discardReasoningEnabled, ignoreHostedToolsEnabled } from "./context-management";
 import type { Provider, ClientKey, Dashboard, McpConnection } from "../shared/types";
 
@@ -50,6 +51,13 @@ export async function api(request: Request) {
   if (path === "/observability" && method === "GET") return Response.json({ ...await capturePolicy(), ...await captureUsage() });
   if (path === "/observability" && method === "PATCH") { const input = z.object({ enabled:z.boolean(), retentionDays:z.number().int().min(1).max(365), maxStageBytes:z.number().int().min(65536).max(64*1024*1024), maxStorageBytes:z.number().int().min(1024*1024).max(5*1024*1024*1024) }).parse(await readJson(request)); return Response.json(await configureCapture(input)); }
   if (path === "/observability/captures" && method === "DELETE") return Response.json(await deleteAllCaptures());
+  if (path === "/storage/usage" && method === "GET") return Response.json(await storageUsage());
+  if (path === "/storage/purge" && method === "POST") {
+    const input = z.object({ categories: z.array(z.enum(["sessions","captures","snapshots","jobs","runs","assets","mcp","traffic","audit","transient"])).min(1).max(10) }).parse(await readJson(request));
+    const result = await purgeStorage(input.categories);
+    if (input.categories.includes("captures")) clearCaptureStates();
+    return Response.json(result);
+  }
   if(path==="/observability/snapshots"&&method==="GET")return Response.json((await db.query("SELECT id,createdAt,updatedAt,label,hash,summary FROM observability_snapshots ORDER BY createdAt DESC LIMIT 100")).map((row:any)=>({...row,summary:JSON.parse(row.summary),legacy:true})));
   if(path.startsWith("/observability/snapshots")||path==="/observability/timeline")throw new ApiError(410,"snapshot_context_required");
   if (path === "/dashboard" && method === "GET") {

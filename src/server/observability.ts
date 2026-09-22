@@ -91,6 +91,8 @@ export const inspectCapture=(id:string)=>read<CaptureInfo>("info",{id});
 export const captureStage=(id:string,stage:CaptureStage,after=-1)=>read<CapturePage>("stage",{id,stage,after});
 export async function deleteCapture(id:string){await read("delete",{id});await audit("observability.deleted",id);return {ok:true};}
 export async function deleteAllCaptures(){await read("deleteAll",{});await audit("observability.cleared","local");return {ok:true};}
+/** 清理抓取后让 worker 丢掉内存态，避免继续往已删除的记录上写。 */
+export function clearCaptureStates(){send({type:"clear"});}
 export async function closeCaptures(){
   const deadline=Date.now()+3000;
   while(pending.size&&Date.now()<deadline)await Bun.sleep(20);
