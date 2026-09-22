@@ -374,7 +374,7 @@ export async function api(request: Request) {
   if (path === "/runs" && method === "GET") return Response.json(await db.getRepository(RunSchema).find({ order: { createdAt: "DESC" }, take: 100 }));
   if (path === "/runs" && method === "POST") {
     const input = z.object({ agent: z.enum(["codex", "claude", "pi"]), goal: z.string().trim().min(1).max(20000), workspace: z.string().min(1).max(1000), routeId: z.string().uuid(), timeoutSeconds: z.number().int().min(10).max(86400).default(600),
-      controls: z.object({ mode: z.enum(["turn", "goal"]).default("turn"), maxTurns: z.number().int().min(1).max(1000).default(20), maxNoProgress: z.number().int().min(1).max(20).default(3),
+      controls: z.object({ mode: z.enum(["turn", "goal"]).default("turn"), maxTurns: z.number().int().min(1).max(1000).default(20), maxNoProgress: z.number().int().min(1).max(20).default(3), coordinatorMode: z.enum(["off", "suggest", "continue"]).default("off"),
         budgetMicros: z.number().int().min(0).max(1e12).nullable().default(null), tokenLimit: z.number().int().min(1).max(1e12).nullable().default(null), permission: z.enum(["read-only", "workspace-write"]).default("read-only"),
         mcpGrants: z.array(grantInput).max(40).default([]), memoryAccess: z.boolean().default(false), completionFiles: z.array(z.object({ path: z.string().min(1).max(1000), contains: z.string().max(10000).optional() })).max(30).default([]),
       }).optional(),

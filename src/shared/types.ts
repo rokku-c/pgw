@@ -78,8 +78,9 @@ export interface GatewayStatus {
 export type RunStatus = "queued" | "starting" | "running" | "evaluating" | "waiting_for_input" | "waiting_for_approval" | "paused" | "blocked" | "budget_exhausted" | "completed" | "failed" | "cancelled";
 export type RunAgent = "codex" | "claude" | "pi";
 export interface CompletionFile { path: string; contains?: string }
+export type CoordinatorMode = "off" | "suggest" | "continue";
 export interface RunControls {
-  mode: "turn" | "goal"; maxTurns: number; maxNoProgress: number;
+  mode: "turn" | "goal"; maxTurns: number; maxNoProgress: number; coordinatorMode: CoordinatorMode;
   budgetMicros: number | null; tokenLimit: number | null;
   permission: "read-only" | "workspace-write"; completionFiles: CompletionFile[];
   mcpGrants?: McpGrant[]; memoryAccess?: boolean;

@@ -80,6 +80,7 @@ export async function createAdapter(run: Run, route: ModelRoute, key: string, ho
       cwd: run.workspace, env, onStderr: output, onError: failure,
       onEvent: async event => {
         if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") append(event.assistantMessageEvent.delta || "");
+        else if (event.type && /(tool|function|command|mcp)/i.test(event.type)) await hooks.event("native.tool", { type: event.type });
         else if (event.type === "agent_settled") finish({ status: "completed" });
         else if (event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(event.method)) await hooks.approval({ id: event.id, method: "pi/input", params: event }, response => native!.send({ type: "extension_ui_response", id: event.id, ...response }));
         else if (event.type === "message_end" && event.message?.role === "assistant" && event.message?.stopReason === "error") finish({ status: "failed", error: event.message.errorMessage || "agent_error" });
@@ -116,7 +117,10 @@ export async function createAdapter(run: Run, route: ModelRoute, key: string, ho
           onEvent: async event => {
             if (event.session_id) { session = event.session_id; await hooks.identity(session!); }
             if (event.type === "assistant") {
-              for (const part of event.message?.content || []) if (part.type === "text") append(part.text + "\n");
+              for (const part of event.message?.content || []) {
+                if (part.type === "text") append(part.text + "\n");
+                else if (part.type === "tool_use") await hooks.event("native.tool", { type: part.type, name: part.name || null });
+              }
             } else if (event.type === "result") {
               const denied = event.permission_denials?.length > 0;
               finish({ status: denied ? "blocked" : event.is_error ? "failed" : "completed", error: denied ? "native_permission_required" : event.is_error ? event.subtype : undefined });

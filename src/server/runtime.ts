@@ -5,9 +5,10 @@ import { ApiError, hash, newClientKey } from "./security";
 import { budgetSummary } from "./budget";
 import { validateGrants, revokeMcpAccess } from "./mcp";
 import { createAdapter, type AgentAdapter, type NativeRequest } from "./agent-adapters";
+import { decideContinuation } from "./coordinator";
 import type { Run, RunStatus, RunControls, RunApproval } from "../shared/types";
 
-export const defaultControls: RunControls = { mode: "turn", maxTurns: 1, maxNoProgress: 3, budgetMicros: null, tokenLimit: null, permission: "read-only", completionFiles: [] };
+export const defaultControls: RunControls = { mode: "turn", maxTurns: 1, maxNoProgress: 3, coordinatorMode: "off", budgetMicros: null, tokenLimit: null, permission: "read-only", completionFiles: [] };
 const owner = crypto.randomUUID();
 interface ActiveRun {
   run: Run; adapter?: AgentAdapter; stop?: { status: RunStatus; reason: string };
@@ -18,6 +19,7 @@ let starting = 0;
 async function getRun(id: string) {
   const run = await db.getRepository(RunSchema).findOneBy({ id });
   if (!run) throw new ApiError(404, "run_not_found");
+  run.controls = { ...defaultControls, ...run.controls };
   return run;
 }
 async function event(run: Run, kind: string, detail: Record<string, unknown> = {}) {
@@ -66,6 +68,7 @@ async function execute(control: ActiveRun, message?: string) {
   const run = control.run;
   const began = Date.now();
   let clientId: string | undefined;
+  let turnToolActivity = false;
   let outputDirty = false;
   let saving = Promise.resolve();
   const remaining = run.timeoutSeconds * 1000 - run.elapsedMs;
@@ -91,6 +94,10 @@ async function execute(control: ActiveRun, message?: string) {
       output: text => { run.output = (run.output + text).slice(-500000); outputDirty = true; },
       identity: async (session, turn = null) => { await update(run, { nativeSessionId: session, nativeTurnId: turn }); },
       event: async (kind, detail) => {
+        if (kind === "native.item" || kind === "native.tool") {
+          const type = String(detail.type || "").toLowerCase();
+          if (/(tool|command|function|mcp|computer|file)/.test(type)) turnToolActivity = true;
+        }
         if (kind === "native.request_resolved") {
           for (const [id, approval] of control.approvals) if (String(approval.nativeId) === String(detail.requestId)) {
             control.approvals.delete(id); await db.getRepository(ApprovalSchema).update(id, { status: "expired", updatedAt: Date.now() });
@@ -108,6 +115,7 @@ async function execute(control: ActiveRun, message?: string) {
       const funds = await budgetSummary("run", run.id);
       if (run.controls.budgetMicros !== null && funds.costMicros + funds.heldMicros >= run.controls.budgetMicros) { control.stop = { status: "budget_exhausted", reason: "cost_limit" }; break; }
       if (run.controls.tokenLimit !== null && funds.tokens + funds.heldTokens >= run.controls.tokenLimit) { control.stop = { status: "budget_exhausted", reason: "token_limit" }; break; }
+      turnToolActivity = false;
       await update(run, { turnCount: run.turnCount + 1, status: "running" });
       await event(run, "turn.started", { input: next });
       const result = await control.adapter.turn(next);
@@ -123,7 +131,13 @@ async function execute(control: ActiveRun, message?: string) {
       const proof = await completion(run);
       await event(run, "goal.evaluated", { mode: run.controls.mode, evidence: proof.evidence });
       if (run.controls.mode === "turn" || proof.complete) { control.stop = { status: "completed", reason: run.controls.mode === "turn" ? "turn_completed" : "criteria_satisfied" }; break; }
-      if (!run.controls.completionFiles.length) { control.stop = { status: "waiting_for_input", reason: "completion_confirmation_required" }; break; }
+      if (!run.controls.completionFiles.length) {
+        const decision = decideContinuation({ mode: run.controls.coordinatorMode, turnStatus: result.status, hasToolActivity: turnToolActivity, completionComplete: proof.complete, approvalsPending: control.approvals.size > 0, userStopped: !!control.stop });
+        await event(run, "coordinator.decided", { ...decision, hasToolActivity: turnToolActivity });
+        if (decision.decision === "continue") { next = decision.message; continue; }
+        control.stop = { status: "waiting_for_input", reason: decision.reason === "tool_result_needs_review" ? "coordinator_suggested_continuation" : "completion_confirmation_required" };
+        break;
+      }
       const progress = hash(JSON.stringify(proof.evidence));
       const noProgressCount = progress === run.progressHash ? run.noProgressCount + 1 : 0;
       await update(run, { progressHash: progress, noProgressCount });
