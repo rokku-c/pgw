@@ -266,8 +266,9 @@ try {
   }
   else if (command === "approve" || command === "deny") { if (!args[1]) throw new Error(`pgw ${command} APPROVAL_ID`); console.log(await request(`/approvals/${args[1]}`, "POST", { accept: command === "approve" })); }
   else if (command === "run") {
-    const { values } = parseArgs({ args: args.slice(2), options: { goal: { type: "string" }, workspace: { type: "string", default: process.cwd() }, model: { type: "string" }, timeout: { type: "string", default: "1800" }, "max-turns": { type: "string", default: "20" }, "budget-usd": { type: "string" }, "token-limit": { type: "string" }, permission: { type: "string", default: "read-only" }, "completion-file": { type: "string", multiple: true }, "single-turn": { type: "boolean", default: false } }, strict: true });
+    const { values } = parseArgs({ args: args.slice(2), options: { goal: { type: "string" }, workspace: { type: "string", default: process.cwd() }, model: { type: "string" }, timeout: { type: "string", default: "1800" }, "max-turns": { type: "string", default: "20" }, "budget-usd": { type: "string" }, "token-limit": { type: "string" }, coordinator: { type: "string", default: "off" }, permission: { type: "string", default: "read-only" }, "completion-file": { type: "string", multiple: true }, "single-turn": { type: "boolean", default: false } }, strict: true });
     if (!["claude", "codex", "pi"].includes(args[1]) || !values.goal) throw new Error("pgw run codex|claude|pi --goal TEXT [--model ALIAS] [--workspace PATH]");
+    if (!["off", "suggest", "continue"].includes(values.coordinator)) throw new Error("--coordinator must be off|suggest|continue");
     await ensureServer();
     const routes = await request<ModelRoute[]>("/routes");
     const runProtocol = args[1] === "claude" ? "messages" as const : args[1] === "codex" ? "responses" as const : null;
@@ -279,7 +280,7 @@ try {
     if (!duration) throw new Error("Invalid timeout");
     const timeoutSeconds = Number(duration[1]) * (duration[2] === "h" ? 3600 : duration[2] === "m" ? 60 : 1);
     console.log(JSON.stringify(await request("/runs", "POST", { agent: args[1], goal: values.goal, workspace: values.workspace, routeId: route.id, timeoutSeconds,
-      controls: { mode: values["single-turn"] ? "turn" : "goal", maxTurns: Number(values["max-turns"]), permission: values.permission,
+      controls: { mode: values["single-turn"] ? "turn" : "goal", maxTurns: Number(values["max-turns"]), coordinatorMode: values["single-turn"] ? "off" : values.coordinator as "off" | "suggest" | "continue", permission: values.permission,
         budgetMicros: values["budget-usd"] ? Math.round(Number(values["budget-usd"]) * 1000000) : null, tokenLimit: values["token-limit"] ? Number(values["token-limit"]) : null,
         completionFiles: (values["completion-file"] || []).map(path => ({ path })) } }), null, 2));
   } else throw new Error(help);
