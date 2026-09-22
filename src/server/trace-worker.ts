@@ -68,30 +68,39 @@ async function sweep(){
   });lastSweep=Date.now();
 }
 async function store(state:State,stage:string,text:string){
-  const bytes=Buffer.from(text,"utf8");let position=0;
+  const bytes=Buffer.from(text,"utf8");
+  // 先在内存里按 32KB 与阶段预算切好块，再一次性落库：一次 flush 一个事务，
+  // 「每块一次配额聚合」也随之降为「每次 flush 一次」。
+  const parts:{bytes:number;cipher:string}[]=[];let position=0,used=state.lengths.get(stage)||0;
   while(position<bytes.length){
-    const used=state.lengths.get(stage)||0,remaining=state.policy.maxStageBytes-used;
-    if(remaining<=0){state.partial=true;state.reason="stage_limit";return;}
+    const remaining=state.policy.maxStageBytes-used;
+    if(remaining<=0){state.partial=true;state.reason="stage_limit";break;}
     let end=Math.min(position+32768,bytes.length,position+remaining);
     while(end<bytes.length&&(bytes[end]&0xc0)===0x80)end--;
-    if(end<=position){state.partial=true;state.reason="stage_limit";return;}
-    const part=bytes.subarray(position,end),cipher=encrypt(part.toString("utf8")),sequence=state.counts.get(stage)||0;
-    const stored=await atomic(database=>{
-      const current=policy(database);const row=database.query('SELECT state FROM request_captures WHERE requestId=?').get(state.id) as {state:string}|null;
-      if(!current?.enabled||current.revision!==state.policy.revision||!row||row.state!=="recording")return "stopped";
-      // 配额吃紧时先腾地方再写，而不是拒绝新内容：记录本身必须落下来。
-      if(usedBytes(database)+part.length>current.maxStorageBytes){
-        evict(database,current.maxStorageBytes-part.length,state.id);
-        if(usedBytes(database)+part.length>current.maxStorageBytes)return "storage_limit";
-      }
-      database.query('INSERT INTO request_capture_parts(requestId,stage,sequence,bytes,bodyCipher) VALUES(?,?,?,?,?)').run(state.id,stage,sequence,part.length,cipher);
-      database.query('UPDATE request_captures SET bytes=bytes+?,updatedAt=? WHERE requestId=?').run(part.length,Date.now(),state.id);return "stored";
-    });
-    if(stored!=="stored"){state.partial=true;state.reason=stored;return;}
-    state.counts.set(stage,sequence+1);state.lengths.set(stage,used+part.length);position=end;
-    await Bun.sleep(0);
+    if(end<=position){state.partial=true;state.reason="stage_limit";break;}
+    const part=bytes.subarray(position,end);
+    parts.push({bytes:part.length,cipher:encrypt(part.toString("utf8"))});
+    used+=part.length;position=end;
   }
+  if(!parts.length)return;
+  const first=state.counts.get(stage)||0,total=parts.reduce((n,part)=>n+part.bytes,0);
+  const stored=await atomic(database=>{
+    const current=policy(database);const row=database.query('SELECT state FROM request_captures WHERE requestId=?').get(state.id) as {state:string}|null;
+    if(!current?.enabled||current.revision!==state.policy.revision||!row||row.state!=="recording")return "stopped";
+    // 配额吃紧时先腾地方再写，而不是拒绝新内容：记录本身必须落下来。
+    if(usedBytes(database)+total>current.maxStorageBytes){
+      evict(database,current.maxStorageBytes-total,state.id);
+      if(usedBytes(database)+total>current.maxStorageBytes)return "storage_limit";
+    }
+    const insert=database.query('INSERT INTO request_capture_parts(requestId,stage,sequence,bytes,bodyCipher) VALUES(?,?,?,?,?)');
+    for(const [index,part]of parts.entries())insert.run(state.id,stage,first+index,part.bytes,part.cipher);
+    database.query('UPDATE request_captures SET bytes=bytes+?,updatedAt=? WHERE requestId=?').run(total,Date.now(),state.id);return "stored";
+  });
+  if(stored!=="stored"){state.partial=true;state.reason=stored;return;}
+  state.counts.set(stage,first+parts.length);state.lengths.set(stage,used);
+  await Bun.sleep(0);
 }
+
 async function handle(message:any){
   if(message.type==="sweep"){await sweep();return;}
   if(message.type==="clear"){states.clear();return;}
