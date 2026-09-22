@@ -11,6 +11,9 @@ const integer = (nullable = false): EntitySchemaColumnOptions => ({ type: "integ
 const json: EntitySchemaColumnOptions = { type: "simple-json" };
 const boolean: EntitySchemaColumnOptions = { type: "boolean" };
 const base = { id: { type: "text", primary: true }, createdAt: integer(), updatedAt: integer() } satisfies Record<string, EntitySchemaColumnOptions>;
+/** 当前 schema 版本。**新增迁移时必须同步改这里** —— 下面的守卫与迁移块若与它脱钩，
+ *  库升到新版本后的下一次启动会被守卫误判为"过新的库"而拒绝启动。 */
+const SCHEMA_VERSION = 22;
 function schema<T extends ObjectLiteral>(name: string, columns: Record<string, EntitySchemaColumnOptions>) {
   return new EntitySchema<T>({ name, tableName: name, columns: { ...base, ...columns } as never });
 }
@@ -87,7 +90,7 @@ export async function initializeStore() {
       await manager.query('CREATE TABLE IF NOT EXISTS mcp_connections (id TEXT PRIMARY KEY, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL, name TEXT NOT NULL, transport TEXT NOT NULL, url TEXT, command TEXT, args TEXT NOT NULL, envCipher TEXT, headersCipher TEXT, enabled BOOLEAN NOT NULL, status TEXT NOT NULL, version TEXT, tools TEXT NOT NULL, capabilities TEXT NOT NULL, schemaHash TEXT, previousSchemaHash TEXT, lastChecked INTEGER, lastError TEXT)');
       await manager.query('INSERT INTO schema_versions(version, appliedAt) VALUES (2, ?)', [Date.now()]);
     });
-  } else if (versions[0].version > 21) throw new Error("Unsupported database schema");
+  } else if (versions[0].version > SCHEMA_VERSION) throw new Error("Unsupported database schema");
   chmodSync(filename, 0o600);
   const [current] = await db.query('SELECT MAX(version) as version FROM schema_versions');
   if (current.version < 3) {
