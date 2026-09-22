@@ -14,7 +14,7 @@ import { safePackagePath,skillMetadata } from "./server/packages";
 import { withinSource } from "./server/session-files";
 import { mcpAlias } from "./server/mcp";
 import { protocolBase, upstreamWireOf } from "./shared/endpoints";
-import { pickRoute } from "./shared/routes";
+import { MODEL_ALIAS_ANY, pickRoute } from "./shared/routes";
 import type { ModelRoute, PublicClient, PublicProvider, WireProtocol } from "./shared/types";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -105,12 +105,20 @@ async function wrap(agent: "claude" | "codex" | "pi", raw: string[]) {
   if (!pick) throw new Error(`Configure a ${protocol || "compatible"} route: ${address}`);
   const route = pick.route;
   if (pick.fallback && protocol) await noteConvertedRoute(route, protocol);
+  // 模型名呈现策略：默认沿用路由别名；PGW_ALIAS 指定任意名字；PGW_TRANSPARENT=1 则完全不注入，
+  // 让 agent 使用它自己配置里的模型名。后两种模式下由客户端的 modelAliases 把它映射回这条路由。
+  const requestedAlias = process.env.PGW_ALIAS?.trim();
+  const transparent = ["1", "true"].includes((process.env.PGW_TRANSPARENT || "").trim().toLowerCase());
+  const injectModel = transparent ? null : (requestedAlias || route.alias);
+  // pi 的模型名由网关生成的 models.json 决定，它没有"自己配置的模型名"，所以透明模式对它无意义。
+  const modelAliases = transparent && agent !== "pi" ? [{ name: MODEL_ALIAS_ANY, routeId: route.id }]
+    : requestedAlias ? [{ name: requestedAlias, routeId: route.id }] : [];
   const workspace = await realpath(process.cwd());
   const access = accessId ? (await request<PublicClient[]>("/clients")).find(c => c.id === accessId && c.enabled && (c.expiresAt === null || c.expiresAt > Date.now())) : undefined;
   if (accessId && !access) throw new Error("MCP access not found");
   if (access?.project && await realpath(access.project) !== workspace) throw new Error("MCP access belongs to another project");
   if (agent === "pi" && access) throw new Error("Pi MCP launch requires an explicit extension; use codex or claude for this access");
-  const client = await request<PublicClient & { key: string }>("/clients", "POST", { kind: "temporary", expiresAt: Date.now() + 8 * 60 * 60 * 1000, mcpGrants: access?.mcpGrants || [], memoryAccess: access?.memoryAccess || false, name: `${agent}:${process.pid}`, project: workspace, personalize: true, routeIds: [route.id] });
+  const client = await request<PublicClient & { key: string }>("/clients", "POST", { kind: "temporary", expiresAt: Date.now() + 8 * 60 * 60 * 1000, mcpGrants: access?.mcpGrants || [], memoryAccess: access?.memoryAccess || false, name: `${agent}:${process.pid}`, project: workspace, personalize: true, routeIds: [route.id], ...(modelAliases.length ? { modelAliases } : {}) });
   const env: Record<string, string | undefined> = { ...process.env };
   for (const key of ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL"]) delete env[key];
   const nativeArgs = raw[0] === "--" ? raw.slice(1) : raw;
@@ -125,23 +133,24 @@ async function wrap(agent: "claude" | "codex" | "pi", raw: string[]) {
       const configHome = await Bun.file(join(originalHome, "config.toml")).exists() ? originalHome : join(home, "agents", "codex");
       await mkdir(configHome, { recursive: true, mode: 0o700 });
       env.CODEX_HOME = configHome; env.PGW_MODEL_KEY = client.key;
-      argv = [executable, ...nativeArgs, "-c", 'model_provider="pgw"', "-c", `model=${JSON.stringify(route.alias)}`,
+      argv = [executable, ...nativeArgs, "-c", 'model_provider="pgw"', ...(injectModel === null ? [] : ["-c", `model=${JSON.stringify(injectModel)}`]),
         "-c", 'model_providers.pgw.name="Personal Gateway"', "-c", `model_providers.pgw.base_url=${JSON.stringify(protocolBase(address,"responses"))}`,
         "-c", 'model_providers.pgw.env_key="PGW_MODEL_KEY"', "-c", 'model_providers.pgw.wire_api="responses"', ...(hasMcp ? ["-c", `mcp_servers.personal_gateway.url=${JSON.stringify(`${address}/mcp`)}`, "-c", 'mcp_servers.personal_gateway.bearer_token_env_var="PGW_MCP_KEY"', "-c", 'mcp_servers.personal_gateway.tool_timeout_sec=180'] : [])];
     } else if (agent === "claude") {
       env.ANTHROPIC_BASE_URL = protocolBase(address,"messages"); env.ANTHROPIC_AUTH_TOKEN = client.key;
-      env.ANTHROPIC_MODEL = route.alias; env.ANTHROPIC_DEFAULT_SONNET_MODEL = route.alias;
-      env.ANTHROPIC_DEFAULT_OPUS_MODEL = route.alias; env.ANTHROPIC_DEFAULT_HAIKU_MODEL = route.alias;
+      if (injectModel !== null) { env.ANTHROPIC_MODEL = injectModel; env.ANTHROPIC_DEFAULT_SONNET_MODEL = injectModel; env.ANTHROPIC_DEFAULT_OPUS_MODEL = injectModel; env.ANTHROPIC_DEFAULT_HAIKU_MODEL = injectModel; }
       claudeConfigDir = join(home, "launches", client.id);
       await mkdir(claudeConfigDir, { recursive: true, mode: 0o700 });
       const settings = join(claudeConfigDir, "settings.json");
       await Bun.write(settings, JSON.stringify({ env: {
         ANTHROPIC_BASE_URL: env.ANTHROPIC_BASE_URL,
         ANTHROPIC_AUTH_TOKEN: env.ANTHROPIC_AUTH_TOKEN,
-        ANTHROPIC_MODEL: route.alias,
-        ANTHROPIC_DEFAULT_SONNET_MODEL: route.alias,
-        ANTHROPIC_DEFAULT_OPUS_MODEL: route.alias,
-        ANTHROPIC_DEFAULT_HAIKU_MODEL: route.alias,
+        ...(injectModel === null ? {} : {
+          ANTHROPIC_MODEL: injectModel,
+          ANTHROPIC_DEFAULT_SONNET_MODEL: injectModel,
+          ANTHROPIC_DEFAULT_OPUS_MODEL: injectModel,
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: injectModel,
+        }),
         CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(route.contextLimit),
         CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: "1"
       }}));
@@ -151,16 +160,18 @@ async function wrap(agent: "claude" | "codex" | "pi", raw: string[]) {
         await Bun.write(mcpConfig, JSON.stringify({ mcpServers: { personal_gateway: { type: "http", url: `${address}/mcp`, headers: { Authorization: "Bearer ${PGW_MCP_KEY}" } } } }));
         await chmod(mcpConfig, 0o600);
       }
-      argv = [executable, ...(mcpConfig ? ["--mcp-config", mcpConfig] : []), "--settings", settings, "--model", route.alias, ...nativeArgs];
+      argv = [executable, ...(mcpConfig ? ["--mcp-config", mcpConfig] : []), "--settings", settings, ...(injectModel === null ? [] : ["--model", injectModel]), ...nativeArgs];
     } else {
       const configHome = join(home, "agents", "pi");
       await mkdir(configHome, { recursive: true, mode: 0o700 });
       env.PI_CODING_AGENT_DIR = configHome; env.PGW_MODEL_KEY = client.key;
+      const piModel = injectModel ?? route.alias;
+      if (transparent) console.error(`pgw: pi 的模型名来自网关生成的 models.json，透明模式对它无效；仍使用 ${route.alias}。`);
       const api = route.protocol === "messages" ? "anthropic-messages" : route.protocol === "responses" ? "openai-responses" : "openai-completions";
-      const config = { providers: { pgw: { baseUrl: route.protocol === "messages" ? `${protocolBase(address,route.protocol)}/v1` : protocolBase(address,route.protocol), apiKey: "$PGW_MODEL_KEY", api, models: [{ id: route.alias, name: route.alias, contextWindow: route.contextLimit, maxTokens: route.outputLimit }] } } };
+      const config = { providers: { pgw: { baseUrl: route.protocol === "messages" ? `${protocolBase(address,route.protocol)}/v1` : protocolBase(address,route.protocol), apiKey: "$PGW_MODEL_KEY", api, models: [{ id: piModel, name: piModel, contextWindow: route.contextLimit, maxTokens: route.outputLimit }] } } };
       const path = join(configHome, "models.json");
       await Bun.write(path, JSON.stringify(config, null, 2)); await chmod(path, 0o600);
-      argv = [executable, "--provider", "pgw", "--model", route.alias, ...nativeArgs];
+      argv = [executable, "--provider", "pgw", "--model", piModel, ...nativeArgs];
     }
     const child = Bun.spawn(argv, { cwd: workspace, env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
     const interrupt = () => child.kill("SIGINT");

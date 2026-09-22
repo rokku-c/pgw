@@ -32,7 +32,15 @@ bun src/cli.ts asset-installs
 
 开发模式启动后，登录密钥和直达地址写入 `.gateway/dev-access.json`（仅当前用户可读，已忽略提交）；非默认端口写入 `dev-access-端口.json`。
 
-数据：`~/.personal-gateway`。环境变量：`PGW_HOME`、`PGW_PORT`、`PGW_MODEL`。
+数据：`~/.personal-gateway`。环境变量：`PGW_HOME`、`PGW_PORT`、`PGW_MODEL`、`PGW_ALIAS`、`PGW_TRANSPARENT`。
+
+包装 agent 时，`PGW_MODEL` 选**背后真正服务它的路由**（按路由别名），不改变该路由对 agent 的呈现方式：
+
+- 默认把路由别名注入给 agent（`-c model=` / `ANTHROPIC_MODEL` / `models.json`），行为不变。
+- `PGW_ALIAS=任意名字` 改为注入这个名字。名字不受路由别名的字符限制（可含 `[` `]` 等），
+  由网关按该次启动创建的客户端的别名映射回这条路由。
+- `PGW_TRANSPARENT=1` 完全不注入，agent 使用它自己配置里的模型名，网关用兜底映射接住它。
+  pi 的模型名由网关生成，透明模式对它无效（会提示并沿用路由别名）。
 
 ### 会话存储与缩容
 

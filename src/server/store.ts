@@ -26,7 +26,7 @@ export const RouteSchema = schema<ModelRoute>("routes", {
 export const ClientSchema = schema<ClientKey>("clients", {
   name: text(), kind: { ...text(), default: "long_term" }, keyHash: { ...text(), unique: true }, keyPreview: text(), enabled: boolean,
   project: text(true), personalize: boolean, routeIds: json, lastUsedAt: integer(true),
-  budgetMicros: integer(true), tokenLimit: integer(true), maxConcurrent: { ...integer(), default: 4 }, runId: text(true), expiresAt: integer(true), mcpGrants: { ...json, default: '[]' }, memoryAccess: { ...boolean, default: false },
+  budgetMicros: integer(true), tokenLimit: integer(true), maxConcurrent: { ...integer(), default: 4 }, runId: text(true), expiresAt: integer(true), mcpGrants: { ...json, default: '[]' }, memoryAccess: { ...boolean, default: false }, modelAliases: { ...json, default: '[]' },
 });
 export const TrafficSchema = schema<Traffic>("traffic", {
   clientId: text(), clientName: text(), routeId: text(), model: text(), providerId: text(), providerName: text(),
@@ -283,6 +283,12 @@ export async function initializeStore() {
   if(adaptiveVersion.version<21){await db.transaction(async manager=>{
     await manager.query('CREATE TABLE IF NOT EXISTS adaptive_context_limits(providerId TEXT NOT NULL,model TEXT NOT NULL,protocol TEXT NOT NULL,learnedLimit INTEGER,lowerBound INTEGER NOT NULL DEFAULT 0,upperBound INTEGER,observations INTEGER NOT NULL DEFAULT 0,lastError TEXT,updatedAt INTEGER NOT NULL,PRIMARY KEY(providerId,model,protocol))');
     await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(21,?)',[Date.now()]);
+  });}
+  const [aliasVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(aliasVersion.version<22){await db.transaction(async manager=>{
+    const existing=await manager.query('PRAGMA table_info(clients)') as {name:string}[];
+    if(!existing.some(c=>c.name==="modelAliases"))await manager.query("ALTER TABLE clients ADD COLUMN modelAliases TEXT NOT NULL DEFAULT '[]'");
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(22,?)',[Date.now()]);
   });}
   await db.query("UPDATE request_captures SET state='partial',reason='gateway_restarted',updatedAt=? WHERE state='recording'",[Date.now()]);
   await db.query("UPDATE asset_deployments SET status='uncertain',error='gateway_restarted',updatedAt=? WHERE status IN ('applying','restoring')",[Date.now()]);

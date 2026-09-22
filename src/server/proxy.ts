@@ -12,6 +12,7 @@ import { balancedTargets, beginRouteSession, frozenPreferences, pinRoute, record
 import { beginCapture, capturePolicy, captureHeaders, captureUrl, type RequestCapture } from "./observability";
 import { applyAdaptiveContext, recordAdaptiveObservation, protocolConversionEnabled, discardReasoningEnabled, ignoreHostedToolsEnabled, retryPolicy } from "./context-management";
 import { upstreamWireOf } from "../shared/endpoints";
+import { MODEL_ALIAS_ANY, resolveRoute } from "../shared/routes";
 import type { ClientKey, ModelRoute, Traffic, WireProtocol, Provider, Target, ConversionSink } from "../shared/types";
 /** 把丢弃明细写成路由决策：推理类与托管工具类分开记，便于在请求查看里区分。 */
 const dropDecisions=(sink:ConversionSink,target:string)=>sink.dropped.map(drop=>({action:isReasoningDrop(drop.type)?"discard_reasoning":"discard_hosted",target,reason:`${drop.type}×${drop.count}`}));
@@ -78,7 +79,12 @@ export async function proxy(request:Request):Promise<Response> {
   const operation=path.match(/^\/v1\/responses\/([A-Za-z0-9_-]{1,300})$/);
   if(operation)return responseOperation(request,client,operation[1]);
   const allowed=(await db.getRepository(RouteSchema).findBy({enabled:true})).filter(r=>!client.routeIds.length || client.routeIds.includes(r.id));
-  if(path==="/v1/models" && request.method==="GET")return Response.json({object:"list",data:allowed.map(r=>({id:r.alias,object:"model",owned_by:"personal-gateway"}))});
+  if(path==="/v1/models" && request.method==="GET"){
+    // 客户端的模型别名也算可用模型名；无别名时输出与原先完全一致。
+    const aliased=(client.modelAliases||[]).filter(a=>a.name!==MODEL_ALIAS_ANY&&allowed.some(r=>r.id===a.routeId)).map(a=>a.name);
+    const names=[...new Set([...allowed.map(r=>r.alias),...aliased])];
+    return Response.json({object:"list",data:names.map(id=>({id,object:"model",owned_by:"personal-gateway"}))});
+  }
   const gemini=path.match(/^\/v1beta\/models\/(.+):(generateContent|streamGenerateContent)$/);
   const protocol:WireProtocol|undefined=gemini?"gemini":({"/v1/responses":"responses","/v1/chat/completions":"chat","/v1/messages":"messages"} as Record<string,WireProtocol>)[path];
   if(!protocol || request.method!=="POST")throw new ApiError(404,"endpoint_not_found");
@@ -91,7 +97,7 @@ export async function proxy(request:Request):Promise<Response> {
   const original=await readJson(request,16*1024*1024,captureConfig.enabled);
   if(gemini && original && typeof original==="object" && !Array.isArray(original)){ original.model=decodeURIComponent(gemini[1]);original.stream=gemini[2]==="streamGenerateContent"; }
   validate(original,protocol);
-  const route=allowed.find(r=>r.alias===original.model);
+  const route=resolveRoute(allowed,original.model,client.modelAliases);
   if(!route)throw new ApiError(404,"model_not_available");
   if(!route.targets.length)throw new ApiError(503,"route_unavailable");
   const group=crypto.randomUUID();
@@ -216,7 +222,7 @@ export async function proxy(request:Request):Promise<Response> {
           traffic.firstTokenMs=traffic.firstByteMs;
           terminal=!['queued','in_progress'].includes(responseStatus);
           if(!terminal)throw new ApiError(502,"unexpected_background_response");
-          const answer=converted?convertResponse(parsed,upstreamWire,protocol,route.alias,sink):parsed;
+          const answer=converted?convertResponse(parsed,upstreamWire,protocol,original.model,sink):parsed;
           capture.chunk("output",converted?new TextEncoder().encode(JSON.stringify(answer)):bytes);
           await finish(responseStatus==="failed"?"failed":"completed",responseStatus==="failed"?"upstream_response_failed":null);
           if(converted)return new Response(JSON.stringify(answer),{status:response.status,headers:{"content-type":"application/json","x-pgw-request-id":group,"x-pgw-attempt-id":traffic.id,"x-pgw-conversion":"json"}});
@@ -225,7 +231,8 @@ export async function proxy(request:Request):Promise<Response> {
         if(!response.body||!response.headers.get("content-type")?.includes("text/event-stream")){await response.body?.cancel();throw new ApiError(502,"invalid_upstream_stream");}
         reader=response.body.getReader();
         let produced=false;
-        const conversion=converted?new StreamConversion(upstreamWire,protocol,route.alias,chunk=>{produced=true;if(traffic.firstTokenMs===null)traffic.firstTokenMs=Date.now()-started;capture.chunk("output",chunk);output?.enqueue(chunk);},sink):null;
+        // 客户端看到的模型名回显它自己请求的名字，而不是背后的路由别名。
+        const conversion=converted?new StreamConversion(upstreamWire,protocol,original.model,chunk=>{produced=true;if(traffic.firstTokenMs===null)traffic.firstTokenMs=Date.now()-started;capture.chunk("output",chunk);output?.enqueue(chunk);},sink):null;
         const markToken=()=>{if(traffic.firstTokenMs===null)traffic.firstTokenMs=Date.now()-started;};
         const parse=(event:ServerEvent)=>{
           if(conversion){conversion.accept(event);usage=conversion.usage;terminal=conversion.complete;responseStatus=conversion.status;traffic.responseId=protocol==="responses"?conversion.id:conversion.upstreamId;return;}

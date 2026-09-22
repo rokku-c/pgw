@@ -17,11 +17,14 @@ export interface ModelRoute extends RecordBase {
   alias: string; protocol: WireProtocol; targets: Target[]; enabled: boolean; strategy: "priority" | "round_robin" | "least_active";
   inputPrice: number | null; outputPrice: number | null; cacheReadPrice: number | null; cacheWritePrice: number | null; cacheWriteLongPrice: number | null; contextLimit: number; outputLimit: number;
 }
+/** 客户端级「模型别名 → 路由」映射。`name` 不限字符（要能接受 `deepseek-flash[1M]` 这类外部记法）；
+ *  `name` 为 `*` 时是兜底：未匹配任何路由别名、也未匹配其它别名的请求名，都用该路由服务。 */
+export interface ModelAlias { name: string; routeId: string }
 export interface ClientKey extends RecordBase {
   name: string; kind: "long_term" | "temporary"; keyHash: string; keyPreview: string; enabled: boolean;
   project: string | null; personalize: boolean; routeIds: string[]; lastUsedAt: number | null;
   budgetMicros: number | null; tokenLimit: number | null; maxConcurrent: number; runId: string | null; expiresAt: number | null;
-  mcpGrants: McpGrant[]; memoryAccess: boolean;
+  mcpGrants: McpGrant[]; memoryAccess: boolean; modelAliases: ModelAlias[];
 }
 export type PublicClient = Omit<ClientKey, "keyHash">;
 export interface Traffic extends RecordBase {

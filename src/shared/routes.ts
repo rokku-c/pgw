@@ -1,4 +1,20 @@
-import type { ModelRoute, WireProtocol } from "./types";
+import type { ModelAlias, ModelRoute, WireProtocol } from "./types";
+
+/** 客户端别名里表示兜底的保留名：未命中任何路由别名与具名别名的请求名都用它指向的路由。 */
+export const MODEL_ALIAS_ANY = "*";
+
+/**
+ * 把请求里的模型名解析到一条**允许的**路由。顺序：路由别名精确匹配（原有语义），
+ * 再查客户端别名（先具名精确、后 `*` 兜底）。别名目标必须落在 `routes` 内，
+ * 因此授权边界仍由 `client.routeIds` 决定，别名不会越权。
+ */
+export function resolveRoute(routes: ModelRoute[], model: string, aliases: ModelAlias[] = []): ModelRoute | undefined {
+  const direct = routes.find(route => route.alias === model);
+  if (direct) return direct;
+  const alias = aliases.find(item => item.name !== MODEL_ALIAS_ANY && item.name === model)
+    ?? aliases.find(item => item.name === MODEL_ALIAS_ANY);
+  return alias ? routes.find(route => route.id === alias.routeId) : undefined;
+}
 
 export type RoutePick = { route: ModelRoute; fallback: boolean };
 

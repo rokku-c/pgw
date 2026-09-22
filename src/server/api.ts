@@ -27,7 +27,7 @@ const routeInput = z.object({ alias: z.string().trim().regex(/^[\w.\-/:]{1,150}$
 const preferenceInput = z.object({ title: name, content: z.string().trim().min(1).max(3000), scope: z.enum(["global", "project"]),
   project: z.string().trim().max(500).nullable().default(null), status: z.enum(["candidate", "active", "paused"]).default("active") });
 const grantInput = z.object({ connectionId: z.string().uuid(), schemaHash: z.string().length(64), tools: z.array(z.string().max(200)).max(2000).default([]), resources: z.array(z.string().max(4096)).max(2000).default([]), prompts: z.array(z.string().max(200)).max(2000).default([]), requireApproval: z.boolean().default(true) });
-const clientInput = z.object({ name, kind: z.enum(["long_term", "temporary"]).default("long_term"), project: z.string().trim().max(500).nullable().default(null), personalize: z.boolean().default(false), routeIds: z.array(z.string().uuid()).max(200).default([]), budgetMicros: z.number().int().min(0).max(1e12).nullable().default(null), tokenLimit: z.number().int().min(1).max(1e12).nullable().default(null), maxConcurrent: z.number().int().min(1).max(32).default(4), expiresAt: z.number().int().min(Date.now()).nullable().default(null), mcpGrants: z.array(grantInput).max(40).default([]), memoryAccess: z.boolean().default(false) }).superRefine((input, context) => {
+const clientInput = z.object({ name, kind: z.enum(["long_term", "temporary"]).default("long_term"), project: z.string().trim().max(500).nullable().default(null), personalize: z.boolean().default(false), routeIds: z.array(z.string().uuid()).max(200).default([]), budgetMicros: z.number().int().min(0).max(1e12).nullable().default(null), tokenLimit: z.number().int().min(1).max(1e12).nullable().default(null), maxConcurrent: z.number().int().min(1).max(32).default(4), expiresAt: z.number().int().min(Date.now()).nullable().default(null), mcpGrants: z.array(grantInput).max(40).default([]), memoryAccess: z.boolean().default(false), modelAliases: z.array(z.object({ name: z.string().trim().min(1).max(200), routeId: z.string().uuid() })).max(50).default([]) }).superRefine((input, context) => {
   if (input.kind === "temporary" && input.expiresAt === null) context.addIssue({ code: "custom", path: ["expiresAt"], message: "temporary_key_expiry_required" });
 });
 function publicProvider(p: Provider) { const { secretCipher, ...rest } = p; return { ...rest, hasSecret: !!secretCipher }; }
@@ -115,6 +115,11 @@ export async function api(request: Request) {
   if (path === "/clients" && method === "POST") {
     const input = clientInput.parse(await readJson(request));
     for (const id of input.routeIds) await get(RouteSchema, id);
+    // 映射目标必须落在本客户端的授权范围内，否则 POST 能解析而 GET/DELETE /v1/responses/{id} 会 404。
+    for (const alias of input.modelAliases) {
+      await get(RouteSchema, alias.routeId);
+      if (input.routeIds.length && !input.routeIds.includes(alias.routeId)) throw new ApiError(400, "model_alias_out_of_scope");
+    }
     await validateGrants(input.mcpGrants);
     const key = newClientKey();
     const item = await db.getRepository(ClientSchema).save({ ...record(), ...input, enabled: true, keyHash: hash(key), keyPreview: `${key.slice(0, 8)}…${key.slice(-4)}`, lastUsedAt: null, runId: null });
