@@ -7,7 +7,7 @@ let connection: Database | undefined;
 function database() {
   if (!connection) {
     connection = new Database(join(home, "gateway.sqlite"), { strict: true });
-    connection.run("PRAGMA busy_timeout = 0");
+    connection.run("PRAGMA busy_timeout = 5000");
     connection.run("PRAGMA foreign_keys = ON");
   }
   return connection;
