@@ -123,6 +123,11 @@ export default {
   "traffic.capture.empty": "暂无正文",
   "settings.observability": "请求可观测性",
   "settings.observabilityHint": "记录新请求的完整正文，可随时关闭。",
+  "settings.captureQuota": "抓取存储",
+  "settings.captureQuotaHint": "已用 {used} / 上限 {limit}，共 {captures} 条记录。超出上限时先丢弃最早抓取的响应增量，记录本身保留并注明丢弃了什么。",
+  "settings.captureRetention": "保留天数",
+  "settings.captureStageLimit": "单阶段上限 · 字节",
+  "settings.captureStorageLimit": "总存储上限 · 字节",
 
   "job.label.sessionRead": "读取会话",
   "error.sessionFileMissing": "原文件不可用",

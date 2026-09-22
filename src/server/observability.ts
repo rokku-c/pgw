@@ -1,4 +1,4 @@
-import { setting,audit } from "./store";
+import { setting,audit,db } from "./store";
 import { atomic } from "./transactions";
 import { ApiError } from "./security";
 import type { CapturePolicy,CaptureStage,CaptureInfo,CapturePage } from "../shared/types";
@@ -51,6 +51,11 @@ export async function capturePolicy(){
   const next={...value,enabled:true,revision:captureDefaults.revision,maxStageBytes:value.maxStageBytes===2*1024*1024?captureDefaults.maxStageBytes:value.maxStageBytes};
   await atomic(database=>database.query("UPDATE settings SET value=?,updatedAt=? WHERE id='observability'").run(JSON.stringify(next),Date.now()));
   return next;
+}
+/** 抓取当前占用量。与 worker 的配额判定同源（真实分块表），供设置页显示「已用 / 上限」。 */
+export async function captureUsage(){
+  const [row]=await db.query("SELECT coalesce(sum(bytes),0) usedBytes,(SELECT count(*) FROM request_captures) captures FROM request_capture_parts") as {usedBytes:number;captures:number}[];
+  return {usedBytes:row.usedBytes,captures:row.captures};
 }
 export async function configureCapture(input:Omit<CapturePolicy,"revision">){
   const value=await atomic(database=>{

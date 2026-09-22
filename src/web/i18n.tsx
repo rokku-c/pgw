@@ -28,6 +28,12 @@ export function tr(key:I18nKey,params:Record<string,string|number|undefined>={})
 }
 export function formatNumber(value:number){return new Intl.NumberFormat(activeLocale,{notation:value>=10000?"compact":"standard",maximumFractionDigits:1}).format(value);}
 export function formatMoney(micros:number){return new Intl.NumberFormat(activeLocale,{style:"currency",currency:"USD",minimumFractionDigits:2,maximumFractionDigits:4}).format(micros/1_000_000);}
+/** 字节按 1024 进制显示；小于 1KB 保持整数字节，便于与小体量抓取对照。 */
+export function formatBytes(value:number){
+  const units=["B","KB","MB","GB","TB"];let size=value,unit=0;
+  while(size>=1024&&unit<units.length-1){size/=1024;unit++;}
+  return `${new Intl.NumberFormat(activeLocale,{maximumFractionDigits:unit===0?0:1}).format(size)} ${units[unit]}`;
+}
 export function formatDate(timestamp:number){return new Intl.DateTimeFormat(activeLocale,{dateStyle:"medium",timeStyle:"short"}).format(timestamp);}
 export function formatTime(timestamp:number){return new Intl.DateTimeFormat(activeLocale,{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).format(timestamp);}
 export function formatRelative(timestamp:number){

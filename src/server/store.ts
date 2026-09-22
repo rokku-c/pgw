@@ -13,7 +13,7 @@ const boolean: EntitySchemaColumnOptions = { type: "boolean" };
 const base = { id: { type: "text", primary: true }, createdAt: integer(), updatedAt: integer() } satisfies Record<string, EntitySchemaColumnOptions>;
 /** 当前 schema 版本。**新增迁移时必须同步改这里** —— 下面的守卫与迁移块若与它脱钩，
  *  库升到新版本后的下一次启动会被守卫误判为"过新的库"而拒绝启动。 */
-const SCHEMA_VERSION = 22;
+const SCHEMA_VERSION = 23;
 function schema<T extends ObjectLiteral>(name: string, columns: Record<string, EntitySchemaColumnOptions>) {
   return new EntitySchema<T>({ name, tableName: name, columns: { ...base, ...columns } as never });
 }
@@ -292,6 +292,14 @@ export async function initializeStore() {
     const existing=await manager.query('PRAGMA table_info(clients)') as {name:string}[];
     if(!existing.some(c=>c.name==="modelAliases"))await manager.query("ALTER TABLE clients ADD COLUMN modelAliases TEXT NOT NULL DEFAULT '[]'");
     await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(22,?)',[Date.now()]);
+  });}
+  const [evictionVersion]=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(evictionVersion.version<23){await db.transaction(async manager=>{
+    const existing=await manager.query('PRAGMA table_info(request_captures)') as {name:string}[];
+    // 淘汰时记录丢了哪些阶段（stage→bytes/chunks），因为同一条 UPDATE 会把 metadata 抹成 {}。
+    if(!existing.some(c=>c.name==="evictedStages"))await manager.query("ALTER TABLE request_captures ADD COLUMN evictedStages TEXT NOT NULL DEFAULT '[]'");
+    await manager.query('CREATE INDEX IF NOT EXISTS captures_state_created ON request_captures(state,createdAt)');
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(23,?)',[Date.now()]);
   });}
   await db.query("UPDATE request_captures SET state='partial',reason='gateway_restarted',updatedAt=? WHERE state='recording'",[Date.now()]);
   await db.query("UPDATE asset_deployments SET status='uncertain',error='gateway_restarted',updatedAt=? WHERE status IN ('applying','restoring')",[Date.now()]);

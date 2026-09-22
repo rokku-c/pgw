@@ -1,4 +1,4 @@
-import { tr, isMessageKey, formatNumber, formatMoney, formatRelative, type I18nKey } from "./i18n";
+import { tr, isMessageKey, formatNumber, formatMoney, formatBytes, formatRelative, type I18nKey } from "./i18n";
 import { useCallback, useEffect, useState } from "react";
 
 export class RequestError extends Error {
@@ -72,4 +72,5 @@ export function errorKey(error: unknown): I18nKey {
 export const errorText = (error: unknown) => tr(errorKey(error));
 export const number = formatNumber;
 export const money = formatMoney;
+export const bytes = formatBytes;
 export const relative = formatRelative;

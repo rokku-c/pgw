@@ -178,10 +178,13 @@ export interface RetryPolicy { enabled: boolean; maxRetries: number; backoffMs: 
 export interface GatewayPolicies { adaptiveContext: AdaptiveContextPolicy; protocolConversion: boolean; transparentRetry: RetryPolicy }
 export interface CapturePolicy { enabled:boolean; revision:number; retentionDays:number; maxStageBytes:number; maxStorageBytes:number }
 export type CaptureStage = "request" | "effective" | "upstream" | "response" | "output";
+export interface CaptureStageUsage { stage:CaptureStage;bytes:number;chunks:number }
 export interface CaptureInfo {
   requestId:string; requestGroupId:string; state:"recording"|"complete"|"partial"|"expired"|"deleted"|"not_captured";
   createdAt:number; updatedAt:number; expiresAt:number; bytes:number; reason:string|null;
-  metadata:Record<string,unknown>; stages:{stage:CaptureStage;bytes:number;chunks:number}[];
+  metadata:Record<string,unknown>; stages:CaptureStageUsage[];
+  /** 已因配额被淘汰的阶段与体量。行本身（state/reason/时间/分组）始终保留，这里说明内容丢了什么。 */
+  evictedStages:CaptureStageUsage[];
 }
 export interface CapturePage { text:string; next:number|null; bytes:number; complete:boolean; fallback?:boolean }
 

@@ -6,17 +6,65 @@ interface State {id:string;policy:CapturePolicy;secrets:string[];meta:Record<str
 const states=new Map<string,State>();
 let chain=Promise.resolve(),lastSweep=0;
 const defaultPolicy:CapturePolicy={enabled:true,revision:3,retentionDays:7,maxStageBytes:16*1024*1024,maxStorageBytes:512*1024*1024};
+/** 配额吃紧时优先放弃的阶段：这两个在流式下按 delta 增长，是体量的绝对大头。 */
+const DELTA_STAGES=["response","output"];
 function policy(database:any):CapturePolicy{const row=database.query("SELECT value FROM settings WHERE id='observability'").get();return row?JSON.parse(row.value):defaultPolicy;}
 function scrubText(text:string){return text;}
 function scrub(value:any):any{return value;}
+/** 配额的唯一真源：真实占用的分块表。写路径与 sweep 都必须用它，否则两者会漂移。 */
+function usedBytes(database:any){return (database.query('SELECT coalesce(sum(bytes),0) n FROM request_capture_parts').get() as {n:number}).n;}
+/** 每阶段体量（用于记录淘汰明细）。 */
+function stageUsage(database:any,requestId:string,only?:string[]){
+  const clause=only?.length?` AND stage IN (${only.map(()=>"?").join(",")})`:"";
+  return database.query(`SELECT stage,sum(bytes) bytes,count(*) chunks FROM request_capture_parts WHERE requestId=?${clause} GROUP BY stage`).all(requestId,...(only||[])) as {stage:string;bytes:number;chunks:number}[];
+}
+/** 淘汰明细并入既有记录（同一阶段可能被多轮淘汰）。 */
+function mergeEvicted(previous:string|null,incoming:{stage:string;bytes:number;chunks:number}[]){
+  const merged:Record<string,{stage:string;bytes:number;chunks:number}>={};
+  const parsed=JSON.parse(previous||"[]");
+  for(const item of Array.isArray(parsed)?parsed:[])merged[item.stage]=item;
+  for(const item of incoming){const found=merged[item.stage];merged[item.stage]=found?{stage:item.stage,bytes:found.bytes+item.bytes,chunks:found.chunks+item.chunks}:item;}
+  return Object.values(merged);
+}
+/**
+ * 把占用降到 limit 以下。**行本身永不删除**，只丢内容并记录丢了什么。
+ * 一级：从最早的抓取开始，只丢 delta 大头（response/output），保留 request/effective/upstream；
+ * 二级：仍超限才对最早的整条丢内容（state=expired、bytes=0）。
+ * `keepId` 是正在写入的抓取，绝不淘汰它自己。返回是否已降到 limit 以下。
+ */
+function evict(database:any,limit:number,keepId:string|null){
+  let used=usedBytes(database);
+  if(used<=limit)return true;
+  const clause=keepId?"AND requestId!=?":"";
+  const rows=database.query(`SELECT requestId,evictedStages FROM request_captures WHERE state NOT IN ('deleted','expired') ${clause} ORDER BY createdAt LIMIT 200`).all(...(keepId?[keepId]:[])) as {requestId:string;evictedStages:string|null}[];
+  for(const row of rows){
+    if(used<=limit)break;
+    const delta=stageUsage(database,row.requestId,DELTA_STAGES);
+    if(!delta.length)continue;
+    const bytes=delta.reduce((n,d)=>n+d.bytes,0);
+    database.query(`DELETE FROM request_capture_parts WHERE requestId=? AND stage IN (${DELTA_STAGES.map(()=>"?").join(",")})`).run(row.requestId,...DELTA_STAGES);
+    // state 不动：recording 行必须保持 recording，否则在途写入会被自己判成 stopped。
+    database.query("UPDATE request_captures SET bytes=MAX(0,bytes-?),evictedStages=?,reason='storage_limit',updatedAt=? WHERE requestId=?").run(bytes,JSON.stringify(mergeEvicted(row.evictedStages,delta)),Date.now(),row.requestId);
+    used-=bytes;
+  }
+  for(const row of rows){
+    if(used<=limit)break;
+    const rest=stageUsage(database,row.requestId);
+    if(!rest.length)continue;
+    const bytes=rest.reduce((n,d)=>n+d.bytes,0);
+    database.query("DELETE FROM request_capture_parts WHERE requestId=?").run(row.requestId);
+    database.query("UPDATE request_captures SET state='expired',reason='storage_limit',bytes=0,evictedStages=?,metadataCipher=?,updatedAt=? WHERE requestId=?").run(JSON.stringify(mergeEvicted(row.evictedStages,rest)),encrypt('{}'),Date.now(),row.requestId);
+    states.delete(row.requestId);
+    used-=bytes;
+  }
+  return used<=limit;
+}
 async function sweep(){
   await atomic(database=>{
     const current=policy(database);const now=Date.now();
     const expired=database.query("SELECT requestId FROM request_captures WHERE state NOT IN ('deleted','expired') AND expiresAt<=? LIMIT 100").all(now) as {requestId:string}[];
-    for(const row of expired){database.query('DELETE FROM request_capture_parts WHERE requestId=?').run(row.requestId);database.query("UPDATE request_captures SET state='expired',reason='retention_expired',bytes=0,metadataCipher=?,updatedAt=? WHERE requestId=?").run(encrypt('{}'),now,row.requestId);states.delete(row.requestId);}
-    if(current){let used=(database.query('SELECT coalesce(sum(bytes),0) n FROM request_capture_parts').get() as {n:number}).n;
-      for(const row of database.query("SELECT requestId,bytes FROM request_captures WHERE state IN ('complete','partial') ORDER BY createdAt LIMIT 100").all() as {requestId:string;bytes:number}[]){if(used<=current.maxStorageBytes)break;database.query('DELETE FROM request_capture_parts WHERE requestId=?').run(row.requestId);database.query("UPDATE request_captures SET state='expired',reason='storage_limit',bytes=0,metadataCipher=?,updatedAt=? WHERE requestId=?").run(encrypt('{}'),now,row.requestId);used-=row.bytes;}
-    }
+    for(const row of expired){const usage=stageUsage(database,row.requestId);database.query('DELETE FROM request_capture_parts WHERE requestId=?').run(row.requestId);database.query("UPDATE request_captures SET state='expired',reason='retention_expired',bytes=0,evictedStages=?,metadataCipher=?,updatedAt=? WHERE requestId=?").run(JSON.stringify(mergeEvicted(null,usage)),encrypt('{}'),now,row.requestId);states.delete(row.requestId);}
+    if(current?.enabled)evict(database,current.maxStorageBytes,null);
   });lastSweep=Date.now();
 }
 async function store(state:State,stage:string,text:string){
@@ -31,8 +79,11 @@ async function store(state:State,stage:string,text:string){
     const stored=await atomic(database=>{
       const current=policy(database);const row=database.query('SELECT state FROM request_captures WHERE requestId=?').get(state.id) as {state:string}|null;
       if(!current?.enabled||current.revision!==state.policy.revision||!row||row.state!=="recording")return "stopped";
-      const total=(database.query('SELECT coalesce(sum(bytes),0) n FROM request_captures').get() as {n:number}).n;
-      if(total+part.length>current.maxStorageBytes)return "storage_limit";
+      // 配额吃紧时先腾地方再写，而不是拒绝新内容：记录本身必须落下来。
+      if(usedBytes(database)+part.length>current.maxStorageBytes){
+        evict(database,current.maxStorageBytes-part.length,state.id);
+        if(usedBytes(database)+part.length>current.maxStorageBytes)return "storage_limit";
+      }
       database.query('INSERT INTO request_capture_parts(requestId,stage,sequence,bytes,bodyCipher) VALUES(?,?,?,?,?)').run(state.id,stage,sequence,part.length,cipher);
       database.query('UPDATE request_captures SET bytes=bytes+?,updatedAt=? WHERE requestId=?').run(part.length,Date.now(),state.id);return "stored";
     });
@@ -71,11 +122,13 @@ async function read(operation:string,args:any){
   if(operation==="deleteAll"){await atomic(database=>{database.query('DELETE FROM request_capture_parts').run();database.query("UPDATE request_captures SET state='deleted',bytes=0,reason='deleted',metadataCipher=?,updatedAt=?").run(encrypt('{}'),Date.now());});states.clear();return {ok:true};}
   if(operation==="delete"){await atomic(database=>{database.query('DELETE FROM request_capture_parts WHERE requestId=?').run(args.id);database.query("UPDATE request_captures SET state='deleted',bytes=0,reason='deleted',metadataCipher=?,updatedAt=? WHERE requestId=?").run(encrypt('{}'),Date.now(),args.id);});states.delete(args.id);return {ok:true};}
   const row=await atomic(database=>database.query('SELECT * FROM request_captures WHERE requestId=?').get(args.id) as any);
-  if(!row){if(operation==="info")return {requestId:args.id,requestGroupId:"",state:"not_captured",createdAt:0,updatedAt:0,expiresAt:0,bytes:0,reason:"not_captured",metadata:{},stages:[]};if(operation==="stage")return {text:"",next:null,bytes:0,complete:false};throw new ApiError(404,"capture_not_found");}
-  if(row.expiresAt<=Date.now()&&!['deleted','expired'].includes(row.state)){await atomic(database=>{database.query('DELETE FROM request_capture_parts WHERE requestId=?').run(args.id);database.query("UPDATE request_captures SET state='expired',bytes=0,reason='retention_expired',metadataCipher=?,updatedAt=? WHERE requestId=?").run(encrypt('{}'),Date.now(),args.id);});states.delete(args.id);if(operation==="info")return {requestId:args.id,requestGroupId:row.requestGroupId,state:"expired",createdAt:row.createdAt,updatedAt:Date.now(),expiresAt:row.expiresAt,bytes:0,reason:"retention_expired",metadata:{},stages:[]};throw new ApiError(410,"capture_expired");}
+  if(!row){if(operation==="info")return {requestId:args.id,requestGroupId:"",state:"not_captured",createdAt:0,updatedAt:0,expiresAt:0,bytes:0,reason:"not_captured",metadata:{},stages:[],evictedStages:[]};if(operation==="stage")return {text:"",next:null,bytes:0,complete:false};throw new ApiError(404,"capture_not_found");}
+  if(row.expiresAt<=Date.now()&&!['deleted','expired'].includes(row.state)){await atomic(database=>{const usage=stageUsage(database,args.id);database.query('DELETE FROM request_capture_parts WHERE requestId=?').run(args.id);database.query("UPDATE request_captures SET state='expired',bytes=0,reason='retention_expired',evictedStages=?,metadataCipher=?,updatedAt=? WHERE requestId=?").run(JSON.stringify(mergeEvicted(row.evictedStages,usage)),encrypt('{}'),Date.now(),args.id);});states.delete(args.id);if(operation==="info")return {requestId:args.id,requestGroupId:row.requestGroupId,state:"expired",createdAt:row.createdAt,updatedAt:Date.now(),expiresAt:row.expiresAt,bytes:0,reason:"retention_expired",metadata:{},stages:[],evictedStages:JSON.parse(row.evictedStages||"[]")};throw new ApiError(410,"capture_expired");}
   if(operation==="info"){
     const stages=await atomic(database=>database.query('SELECT stage,sum(bytes) bytes,count(*) chunks FROM request_capture_parts WHERE requestId=? GROUP BY stage').all(args.id));
-    const {metadataCipher,policyRevision,...rest}=row;return {...rest,metadata:JSON.parse(decrypt(metadataCipher)),stages};
+    const {metadataCipher,policyRevision,...rest}=row;
+    const evicted=JSON.parse(row.evictedStages||"[]");
+    return {...rest,metadata:JSON.parse(decrypt(metadataCipher)),stages,evictedStages:Array.isArray(evicted)?evicted:[]};
   }
   if(['deleted','expired'].includes(row.state))throw new ApiError(410,"capture_expired");
   let stage=args.stage as string;
@@ -96,3 +149,5 @@ async function read(operation:string,args:any){
     }
   }).catch(()=>{});
 };
+/** 定期跑保留期与配额清理。原先只有配置变更与 60s 懒触发会跑，配额超限后可能长时间无人回收。 */
+setInterval(()=>{chain=chain.then(()=>sweep()).catch(()=>{});},60000);

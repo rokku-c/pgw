@@ -230,6 +230,9 @@ export async function proxy(request:Request):Promise<Response> {
         }
         if(!response.body||!response.headers.get("content-type")?.includes("text/event-stream")){await response.body?.cancel();throw new ApiError(502,"invalid_upstream_stream");}
         reader=response.body.getReader();
+        // 透传时客户端收到的就是上游字节，output 与 response 完全相同：只存一份，
+        // 读侧按 metadata.outputSource 回退到 response（省掉一份等量重复）。
+        if(!converted)capture.metadata({outputSource:"response"});
         let produced=false;
         // 客户端看到的模型名回显它自己请求的名字，而不是背后的路由别名。
         const conversion=converted?new StreamConversion(upstreamWire,protocol,original.model,chunk=>{produced=true;if(traffic.firstTokenMs===null)traffic.firstTokenMs=Date.now()-started;capture.chunk("output",chunk);output?.enqueue(chunk);},sink):null;
@@ -265,7 +268,7 @@ export async function proxy(request:Request):Promise<Response> {
                 touch();if(traffic.firstByteMs===null)traffic.firstByteMs=Date.now()-started;
                 capture.chunk("response",next.value);
                 parser.push(next.value);
-                if(!conversion){capture.chunk("output",next.value);controller.enqueue(next.value);produced=true;}
+                if(!conversion){controller.enqueue(next.value);produced=true;}
               }
             }catch(error){
               const reason=error instanceof ApiError?error.code:controllerSignalReason();

@@ -124,6 +124,11 @@ const messages = {
   "traffic.capture.empty": "No captured body",
   "settings.observability": "Request observability",
   "settings.observabilityHint": "Capture complete bodies for new requests; disable anytime.",
+  "settings.captureQuota": "Capture storage",
+  "settings.captureQuotaHint": "Using {used} of {limit} across {captures} records. Over quota, response deltas of the oldest captures go first; the records stay and record what was dropped.",
+  "settings.captureRetention": "Retention · days",
+  "settings.captureStageLimit": "Per-stage limit · bytes",
+  "settings.captureStorageLimit": "Total storage limit · bytes",
 
   "job.label.sessionRead": "Read session",
   "error.sessionFileMissing": "Source file unavailable",
