@@ -19,6 +19,7 @@ export interface AgentAdapter {
   steer: (message: string) => Promise<void>;
   interrupt: () => Promise<void>;
   close: () => Promise<void>;
+  drain: () => Promise<void>;
 }
 export async function createAdapter(run: Run, route: ModelRoute, key: string, hooks: AdapterHooks): Promise<AgentAdapter> {
   const executable = Bun.which(run.agent);
@@ -54,7 +55,7 @@ export async function createAdapter(run: Run, route: ModelRoute, key: string, ho
         if (event.method === "turn/started") { turnId = p.turn.id; await hooks.identity(session!, turnId); }
         else if (event.method === "item/agentMessage/delta") append(p.delta || "");
         else if (event.method === "item/commandExecution/outputDelta") output(p.delta || "");
-        else if (event.method === "item/completed") await hooks.event("native.item", { id: p.item?.id, type: p.item?.type, status: p.item?.status });
+        else if (event.method === "item/completed") await hooks.event("native.tool", { id: p.item?.id, type: p.item?.type, status: p.item?.status, phase: "result" });
         else if (event.method === "turn/completed") { await hooks.event("native.turn", { id: p.turn?.id, status: p.turn?.status }); finish({ status: p.turn?.status === "completed" ? "completed" : p.turn?.status === "interrupted" ? "interrupted" : "failed", error: p.turn?.error?.message }); }
         else if (event.method === "serverRequest/resolved") await hooks.event("native.request_resolved", { requestId: p.requestId });
       },
@@ -80,7 +81,7 @@ export async function createAdapter(run: Run, route: ModelRoute, key: string, ho
       cwd: run.workspace, env, onStderr: output, onError: failure,
       onEvent: async event => {
         if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") append(event.assistantMessageEvent.delta || "");
-        else if (event.type && /(tool|function|command|mcp)/i.test(event.type)) await hooks.event("native.tool", { type: event.type });
+        else if (event.type && /(tool|function|command|mcp)/i.test(event.type)) await hooks.event("native.tool", { type: event.type, phase: /(result|end|complete|done|output)/i.test(event.type) ? "result" : "pending" });
         else if (event.type === "agent_settled") finish({ status: "completed" });
         else if (event.type === "extension_ui_request" && ["confirm", "select", "input", "editor"].includes(event.method)) await hooks.approval({ id: event.id, method: "pi/input", params: event }, response => native!.send({ type: "extension_ui_response", id: event.id, ...response }));
         else if (event.type === "message_end" && event.message?.role === "assistant" && event.message?.stopReason === "error") finish({ status: "failed", error: event.message.errorMessage || "agent_error" });
@@ -119,7 +120,7 @@ export async function createAdapter(run: Run, route: ModelRoute, key: string, ho
             if (event.type === "assistant") {
               for (const part of event.message?.content || []) {
                 if (part.type === "text") append(part.text + "\n");
-                else if (part.type === "tool_use") await hooks.event("native.tool", { type: part.type, name: part.name || null });
+                else if (part.type === "tool_use" || part.type === "tool_result") await hooks.event("native.tool", { type: part.type, name: part.name || null, phase: part.type === "tool_result" ? "result" : "pending" });
               }
             } else if (event.type === "result") {
               const denied = event.permission_denials?.length > 0;
@@ -147,5 +148,6 @@ export async function createAdapter(run: Run, route: ModelRoute, key: string, ho
       } finally { finish({ status: "interrupted" }); }
     },
     async close() { finish({ status: "interrupted" }); await native?.close(); },
+    async drain() { await native?.drained(); },
   };
 }
