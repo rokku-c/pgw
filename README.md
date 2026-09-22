@@ -1,5 +1,25 @@
 # Personal Gateway
 
+## 安装
+
+### 本地仓库
+
+```sh
+bun link
+pgw open
+```
+
+### GitHub
+
+```sh
+bun install -g github:rokku-c/pgw
+pgw open
+```
+
+全局安装后可在任意目录使用 `pgw`。
+
+## 本地开发
+
 ```sh
 bun install
 bun run start
@@ -52,3 +72,10 @@ bun src/cli.ts storage compact
 ```
 
 停止网关后执行压缩，完成后重新 `bun run dev`。压缩先取得网关运行归属锁，移除旧全文索引，核对源文件前缀后清理重复正文并回收空闲页。源文件不可用或已改写时保留历史正文。维护输出阶段与进度，不删除原始会话、配置、凭据、偏好或调用记录；运行中的数据库拒绝压缩。
+
+### CLI 查询与 MCP
+
+只读 CLI 查询命令与 MCP 共用同一份命令映射：`status`、`sources`、`sessions`、`persona`、`skills`、`asset-roots`、`asset-installs`、`jobs`、`mcp`、`export`。
+MCP `/mcp` 额外提供 `gateway_cli(command, args)` 工具，以及 `pgw://gateway/...` JSON 资源；资源和查询遵循客户端的 `memoryAccess` 与项目范围。
+
+MCP 只复用现有 `/api` 查询，不复制业务逻辑；启动、写入、运行控制和 `storage compact` 仍保留在 CLI/API，不通过这个只读工具暴露。

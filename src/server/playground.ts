@@ -8,7 +8,7 @@ import { EventStreamParser } from "./event-stream";
 import { retryAfter } from "./routing";
 
 export const debugInput=z.object({
-  routeId:z.string().uuid(),protocol:z.enum(["responses","chat","messages","gemini"]),body:z.record(z.string(),z.unknown()),
+  routeId:z.string().uuid(),protocol:z.enum(["responses","chat","messages","gemini","systemone"]),body:z.record(z.string(),z.unknown()),
   project:z.string().max(4096).nullable().default(null),personalize:z.boolean().default(false),
   retry:z.object({maxAttempts:z.number().int().min(1).max(10000).nullable().default(1),baseDelayMs:z.number().int().min(250).max(60000).default(1000),maxDelayMs:z.number().int().min(1000).max(300000).default(30000),retryUnknownOutcome:z.boolean().default(false)}).default({maxAttempts:1,baseDelayMs:1000,maxDelayMs:30000,retryUnknownOutcome:false}),
 });

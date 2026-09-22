@@ -13,6 +13,7 @@ import { address, port, adminToken, writeDevAccessFile } from "./config";
 import { closeCaptures } from "./observability";
 
 let ready = false;
+const pwaDirectory = `${import.meta.dir}/../web/pwa`;
 
 async function handle(request: Request, handler: (request: Request) => Promise<Response>) {
   try {
@@ -37,6 +38,8 @@ const server = Bun.serve({
     "/": page,
     "/app": page,
     "/app/*": page,
+    "/pwa/icon-192.png": new Response(Bun.file(`${pwaDirectory}/icon-192.png`)),
+    "/pwa/icon-512.png": new Response(Bun.file(`${pwaDirectory}/icon-512.png`)),
     "/api/*": request => handle(request, api),
     "/providers/*": request => handle(request, proxy),
     "/v1/*": request => handle(request, proxy),

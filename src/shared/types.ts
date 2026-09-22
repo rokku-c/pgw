@@ -1,5 +1,5 @@
-export type Protocol = "openai" | "anthropic" | "gemini";
-export type WireProtocol = "responses" | "chat" | "messages" | "gemini";
+export type Protocol = "openai" | "anthropic" | "gemini" | "typesafe";
+export type WireProtocol = "responses" | "chat" | "messages" | "gemini" | "systemone";
 /** 互转时被丢弃的内容。`count` 在能界定边界的协议里是真实块数，chat/gemini 的匿名增量每类型至多记 1。 */
 export interface ConversionDrop { type: string; count: number }
 /** 互转降级开关：`reasoning` 丢弃推理块，`hosted` 忽略托管工具声明；两者默认为假时转换行为与关闭前逐字节相同。 */
@@ -72,7 +72,7 @@ export interface Dashboard {
   providers: number; agents: number; skills: number; mcp: number; sessions: number; preferences: number;
 }
 export interface GatewayStatus {
-  version: string; uptime: number; address: string; database: "sqlite";
+  version: string; apiVersion: number; uptime: number; address: string; database: "sqlite";
   personalization: boolean; captureBodies: boolean;
 }
 export type RunStatus = "queued" | "starting" | "running" | "evaluating" | "waiting_for_input" | "waiting_for_approval" | "paused" | "blocked" | "budget_exhausted" | "completed" | "failed" | "cancelled";

@@ -6,7 +6,8 @@ import { z } from "zod";
 import { db, McpSchema, ClientSchema, AssetSchema, SessionSchema, PreferenceSchema, McpCallSchema, McpRevisionSchema, record, audit } from "./store";
 import { decrypt, encrypt, hash, ApiError, requireAdmin, isAdmin, bearer } from "./security";
 import { atomic } from "./transactions";
-import { version, home } from "./config";
+import { version, home, address, adminToken } from "./config";
+import { cliQueryCommands, cliQueryPath, scopeCliQueryPath } from "../shared/cli-queries";
 import type { McpConnection, McpGrant, McpCall, ClientKey, PublicMcpCall } from "../shared/types";
 
 type Principal = { id: string | null; name: string; project: string | null; sessionKey?: string | null; nativeSessionId?: string | null; nativeTurnId?: string | null; runId?: string | null; parentCallId?: string | null; evidence?: string | null };
@@ -198,6 +199,44 @@ export async function callMcp(config: McpConnection, name: string, args: Record<
   return executeMcp(config, "tool", name, args, { id: null, name: "Console", project: null }, signal, true);
 }
 export async function stopMcpCalls() { for (const controller of active.values()) controller.abort(); while (active.size) await Bun.sleep(25); }
+const gatewayResources = [
+  ["status", [], "pgw://gateway/status", "Gateway status"],
+  ["sources", [], "pgw://gateway/sources", "Session sources"],
+  ["sessions", [], "pgw://gateway/sessions", "Session index"],
+  ["persona", [], "pgw://gateway/persona", "Confirmed preferences"],
+  ["skills", [], "pgw://gateway/skills", "Installed skills"],
+  ["asset-roots", [], "pgw://gateway/asset-roots", "Skill asset roots"],
+  ["asset-installs", [], "pgw://gateway/asset-installs", "Skill installations"],
+  ["jobs", [], "pgw://gateway/jobs", "Background jobs"],
+  ["mcp", [], "pgw://gateway/mcp", "MCP connections"],
+  ["mcp", ["calls"], "pgw://gateway/mcp-calls", "MCP calls"],
+  ["export", [], "pgw://gateway/export", "Gateway inventory export"],
+] as const;
+
+async function localCliQuery(path: string, signal: AbortSignal): Promise<unknown> {
+  const response = await fetch(`${address}/api${path}`, {
+    headers: { authorization: `Bearer ${adminToken}` },
+    signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
+  });
+  const result = await response.json() as any;
+  if (!response.ok) throw new ApiError(response.status, result.error?.code || "query_failed");
+  if (response.status === 202 && result.job) {
+    for (;;) {
+      await Bun.sleep(200);
+      const job = await localCliQuery(`/jobs/${result.job.id}`, signal) as any;
+      if (job.status === "completed") return job.result;
+      if (["failed", "cancelled", "uncertain"].includes(job.status)) throw new ApiError(502, job.error || job.status);
+    }
+  }
+  return result;
+}
+
+async function runCliQuery(command: string, args: string[], client: ClientKey | null, signal: AbortSignal) {
+  if (client && command !== "status" && !client.memoryAccess) throw new ApiError(403, "mcp_scope_denied");
+  const path = scopeCliQueryPath(cliQueryPath(command, args), client?.project);
+  return localCliQuery(path, signal);
+}
+
 async function authenticatedClient(request: Request) {
   if (isAdmin(request)) { requireAdmin(request); return null; }
   const key = bearer(request);
@@ -214,8 +253,26 @@ export async function handleMcp(request: Request) {
   const sessionKey=rawSession?`external:${hash(`${client?.id||"admin"}:${rawSession}:${client?.project||""}`)}`:null;
   const principal: Principal = client ? { id: client.id, name: client.name, project: client.project, sessionKey, nativeSessionId, nativeTurnId, runId: client.runId, parentCallId: request.headers.get("x-pgw-attempt-id"), evidence: request.headers.get("x-pgw-attempt-id") ? "model_call_header" : nativeSessionId ? "native_session_header" : null } : { id: null, name: "Admin MCP", project: null, sessionKey, nativeSessionId, nativeTurnId, parentCallId: request.headers.get("x-pgw-attempt-id"), evidence: "admin_request" };
   const server = new McpServer({ name: "personal-gateway", version }, { capabilities: { tools: {}, resources: {}, prompts: {} } });
-  const exposed = { tools: !client || client.memoryAccess ? 3 : 0, resources: 0, prompts: 0 };
+  const exposed = { tools: 1 + (!client || client.memoryAccess ? 3 : 0), resources: client && !client.memoryAccess ? 1 : gatewayResources.length, prompts: 0 };
   const reauthorize = async () => { const next = await authenticatedClient(request); if (client && next?.id !== client.id) throw new ApiError(403, "mcp_scope_denied"); return next; };
+  server.registerTool("gateway_cli", {
+    title: "Gateway CLI query",
+    description: "Run a read-only pgw query. Commands match the query-capable CLI commands.",
+    inputSchema: z.object({ command: z.enum(cliQueryCommands), args: z.array(z.string().max(2000)).max(20).default([]) }),
+    annotations: { readOnlyHint: true },
+  }, async ({ command, args }, context) => {
+    const fresh = await reauthorize();
+    const result = await runCliQuery(command, args, fresh, context.mcpReq.signal);
+    return { content: [{ type: "text", text: JSON.stringify(result) }] };
+  });
+  for (const [command, args, uri, description] of gatewayResources) {
+    if (client && !client.memoryAccess && command !== "status") continue;
+    server.registerResource(`gateway_${uri.split("/").at(-1)}`, uri, { description, mimeType: "application/json" }, async (url, context) => {
+      const fresh = await reauthorize();
+      const result = await runCliQuery(command, [...args], fresh, context.mcpReq.signal);
+      return { contents: [{ uri: url.href, mimeType: "application/json", text: JSON.stringify(result, null, 2) }] };
+    });
+  }
   if (!client || client.memoryAccess) {
     server.registerTool("gateway_inventory", { title: "Gateway inventory", inputSchema: z.object({ kind: z.enum(["agent", "skill", "mcp"]).optional() }), annotations: { readOnlyHint: true } }, async ({ kind }) => {
       const fresh = await reauthorize(); if (fresh && !fresh.memoryAccess) throw new ApiError(403, "mcp_scope_denied");

@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { homedir } from "node:os";
 import assert from "node:assert/strict";
-import { adminToken, home, address, port, devAccessPath } from "./server/config";
+import { adminToken, home, address, port, devAccessPath, version, apiVersion } from "./server/config";
 import { projectContent, semanticDiff } from "./server/trajectory-projection";
 import { costMicros } from "./server/budget";
 import { parseSessionLine } from "./server/session-parser";
@@ -15,16 +15,34 @@ import { withinSource } from "./server/session-files";
 import { mcpAlias } from "./server/mcp";
 import { protocolBase, upstreamWireOf } from "./shared/endpoints";
 import { MODEL_ALIAS_ANY, pickRoute } from "./shared/routes";
+import { cliQueryPath } from "./shared/cli-queries";
 import type { ModelRoute, PublicClient, PublicProvider, WireProtocol } from "./shared/types";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
 let accessId: string | undefined;
 if (args[0] === "--access") { accessId = args[1]; if (!accessId) throw new Error("pgw --access CLIENT_ID claude|codex"); args.splice(0, 2); }
+const help = `pgw v${version} · API v${apiVersion}
+
+Usage: pgw open | start | status | storage | doctor | scan | export | claude | codex | pi | run | pause | resume | steer | stop | complete | approvals | approve | deny`;
+let negotiatedVersion: string | undefined;
+function versionNotice(status: { version: string; apiVersion?: number }) {
+  if (status.version === version && status.apiVersion === apiVersion) return;
+  if (status.apiVersion === apiVersion) return `pgw: CLI v${version} / server v${status.version} 不完全一致，但 API v${apiVersion} 兼容；可忽略并继续使用。`;
+  return `pgw: 警告：CLI v${version} (API v${apiVersion}) / server v${status.version} (API v${status.apiVersion ?? "unknown"}) 不兼容，存在版本不匹配风险。`;
+}
+function negotiateVersion(status: { version: string; apiVersion?: number }) {
+  const key = `${status.version}:${status.apiVersion}`;
+  if (negotiatedVersion === key) return;
+  negotiatedVersion = key;
+  const notice = versionNotice(status);
+  if (notice) console.error(notice);
+}
 async function request<T>(path: string, method = "GET", body?: unknown): Promise<T> {
   const response = await fetch(`${address}/api${path}`, { method, headers: { authorization: `Bearer ${adminToken}`, "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(15000) });
   const result = await response.json() as any;
   if (!response.ok) throw new Error(result.error?.code || `HTTP ${response.status}`);
+  if (path === "/status") negotiateVersion(result);
   if(response.status===202&&result.job){
     console.error(`${result.job.label} · ${result.job.id}`);
     while(true){await Bun.sleep(400);const job=await request<any>(`/jobs/${result.job.id}`);if(job.status==="completed")return job.result as T;if(["failed","cancelled","uncertain"].includes(job.status))throw new Error(job.error||job.status);}
@@ -52,8 +70,12 @@ async function doctor() {
   assert.equal(JSON.stringify(stream.blocks).match(/hello/g)?.length,1);
   assert.ok(projectContent('{"messages":[',false).warnings.includes("unparsed_body"));
 
-  const status = await request<{ database: string; version: string }>("/status");
+  const status = await request<{ database: string; version: string; apiVersion: number }>("/status");
   assert.equal(status.database, "sqlite");
+  assert.equal(status.apiVersion, apiVersion);
+  assert.equal(versionNotice({ version, apiVersion }), undefined);
+  assert.match(versionNotice({ version: "0.1.1", apiVersion })!, /兼容/);
+  assert.match(versionNotice({ version: "1.0.0", apiVersion: apiVersion + 1 })!, /警告/);
   const catalog=await request<import("./shared/trajectory").TrajectorySessionPage>("/trajectory/sessions?limit=2");
   assert.ok(catalog.items.length<=2);
   assert.equal(new Set(catalog.items.map(item=>item.key)).size,catalog.items.length);
@@ -183,7 +205,11 @@ async function wrap(agent: "claude" | "codex" | "pi", raw: string[]) {
 }
 try {
   const command = args[0] || "open";
-  if (["claude", "codex", "pi"].includes(command)) await wrap(command as "claude" | "codex" | "pi", args.slice(1));
+  if (["help", "--help", "-h"].includes(command)) console.log(help);
+  else if (["version", "--version", "-v"].includes(command)) console.log(`pgw v${version} · API v${apiVersion}`);
+  else {
+    if (!(["start", "storage"].includes(command))) await ensureServer();
+    if (["claude", "codex", "pi"].includes(command)) await wrap(command as "claude" | "codex" | "pi", args.slice(1));
   else if (command === "start") {
     const child = Bun.spawn([process.execPath, join(root, "src/server/index.ts")], { cwd: root, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
     const stop = () => child.kill("SIGTERM"); process.on("SIGINT", stop); process.on("SIGTERM", stop);
@@ -200,13 +226,10 @@ try {
     else if (!args[1] || args[1] === "status") console.log(JSON.stringify(await storage.storageStatus(), null, 2));
     else throw new Error("pgw storage status | compact (stop the gateway before compacting)");
   }
-  else if (command === "status") console.log(JSON.stringify(await request("/status"), null, 2));
-  else if (command === "scan") { await ensureServer(); console.log(JSON.stringify(await request("/registry/scan", "POST"), null, 2)); }
-  else if (command === "sources") console.log(JSON.stringify(await request("/sources"), null, 2));
-  else if (command === "sessions") {
-    const { values } = parseArgs({ args: args.slice(1), options: { query: { type: "string" }, agent: { type: "string" }, offset: { type: "string" } } });
-    console.log(JSON.stringify(await request(`/sessions?paged=1&${new URLSearchParams(Object.fromEntries(Object.entries(values).filter(([,v]) => v !== undefined)) as Record<string,string>)}`), null, 2));
+  else if (["status", "sources", "sessions", "persona", "skills", "asset-roots", "asset-installs", "jobs", "export"].includes(command)) {
+    console.log(JSON.stringify(await request(cliQueryPath(command, args.slice(1))), null, 2));
   }
+  else if (command === "scan") { await ensureServer(); console.log(JSON.stringify(await request("/registry/scan", "POST"), null, 2)); }
   else if (command === "source") {
     const action = args[1], id = args[2];
     if (!id || !["add", "pause", "scan"].includes(action)) throw new Error("pgw source add PATH --name NAME [--capture] [--learn] | pause SOURCE_ID | scan SOURCE_ID");
@@ -216,13 +239,6 @@ try {
     } else if (action === "scan") console.log(JSON.stringify(await request(`/sources/${id}/scan`, "POST"), null, 2));
     else { const sources = await request<import("./shared/types").CollectionSource[]>("/sources"); const source = sources.find(s => s.id === id); if (!source) throw new Error("Source not found"); console.log(await request(`/sources/${id}`, "PATCH", { ...source, enabled: false })); }
   }
-  else if (command === "persona") {
-    if (args[1] === "timeline") console.log(JSON.stringify(await request("/preferences/timeline"), null, 2));
-    else if (args[1] === "history" && args[2]) console.log(JSON.stringify(await request(`/preferences/${args[2]}/history`), null, 2));
-    else console.log(JSON.stringify(await request("/preferences"), null, 2));
-  }
-  else if(command==="skills") console.log(JSON.stringify(await request(`/skills?query=${encodeURIComponent(args.slice(1).join(" "))}`),null,2));
-  else if(command==="asset-roots") console.log(JSON.stringify(await request("/asset-roots"),null,2));
   else if(command==="asset-snapshot") {if(!args[1])throw new Error("pgw asset-snapshot ASSET_ID");console.log(JSON.stringify(await request(`/assets/${args[1]}/snapshot`,"POST",{confirmed:true}),null,2));}
   else if(command==="asset-preview") {
     if(!args[1])throw new Error("pgw asset-preview ASSET_ID --snapshot ID --target DIRECTORY --name NAME");
@@ -234,9 +250,6 @@ try {
     if(!args[1]||args[2]!=="--confirm")throw new Error(`pgw ${command} PLAN_ID --confirm`);
     console.log(JSON.stringify(await request(`/asset-deployments/${args[1]}/${command==="asset-apply"?"apply":"restore"}`,"POST",{confirmed:true}),null,2));
   }
-  else if(command==="asset-installs") console.log(JSON.stringify(await request("/asset-deployments"),null,2));
-  else if(command==="jobs")console.log(JSON.stringify(await request("/jobs"),null,2));
-  else if (command === "export") console.log(JSON.stringify(await request("/inventory"), null, 2));
   else if (["stop", "pause", "complete"].includes(command)) { if (!args[1]) throw new Error(`pgw ${command} RUN_ID`); console.log(await request(`/runs/${args[1]}/${command}`, "POST")); }
   else if (command === "resume") {
     if (!args[1]) throw new Error("pgw resume RUN_ID [--message TEXT] [--extra-turns N] [--extra-seconds N]");
@@ -246,10 +259,10 @@ try {
   else if (command === "steer") { if (!args[1] || !args[2]) throw new Error("pgw steer RUN_ID MESSAGE"); console.log(await request(`/runs/${args[1]}/steer`, "POST", { message: args.slice(2).join(" ") })); }
   else if (command === "approvals") console.log(JSON.stringify({ native: await request("/approvals"), mcp: await request("/mcp-calls?status=pending") }, null, 2));
   else if (command === "mcp") {
-    if (args[1] === "calls") console.log(JSON.stringify(await request("/mcp-calls"), null, 2));
+    if (args[1] === "calls") console.log(JSON.stringify(await request(cliQueryPath("mcp", ["calls"])), null, 2));
     else if (["approve", "deny"].includes(args[1]) && args[2]) console.log(await request(`/mcp-calls/${args[2]}/decide`, "POST", { accept: args[1] === "approve" }));
     else if (args[1] === "cancel" && args[2]) console.log(await request(`/mcp-calls/${args[2]}/cancel`, "POST"));
-    else console.log(JSON.stringify(await request("/mcp"), null, 2));
+    else console.log(JSON.stringify(await request(cliQueryPath("mcp")), null, 2));
   }
   else if (command === "approve" || command === "deny") { if (!args[1]) throw new Error(`pgw ${command} APPROVAL_ID`); console.log(await request(`/approvals/${args[1]}`, "POST", { accept: command === "approve" })); }
   else if (command === "run") {
@@ -269,5 +282,6 @@ try {
       controls: { mode: values["single-turn"] ? "turn" : "goal", maxTurns: Number(values["max-turns"]), permission: values.permission,
         budgetMicros: values["budget-usd"] ? Math.round(Number(values["budget-usd"]) * 1000000) : null, tokenLimit: values["token-limit"] ? Number(values["token-limit"]) : null,
         completionFiles: (values["completion-file"] || []).map(path => ({ path })) } }), null, 2));
-  } else throw new Error("pgw open | start | status | storage | doctor | scan | export | claude | codex | pi | run | pause | resume | steer | stop | complete | approvals | approve | deny");
+  } else throw new Error(help);
+  }
 } catch (error) { console.error(error instanceof Error ? error.message : error); process.exitCode = 1; }

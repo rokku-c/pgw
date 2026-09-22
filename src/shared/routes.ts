@@ -28,9 +28,9 @@ export type RoutePick = { route: ModelRoute; fallback: boolean };
  */
 export function pickRoute(routes: ModelRoute[], preferred: WireProtocol | null, alias?: string): RoutePick | undefined {
   const enabled = routes.filter(route => route.enabled && (!alias || route.alias === alias));
-  if (preferred === null) { const route = enabled.find(item => item.protocol !== "gemini"); return route ? { route, fallback: false } : undefined; }
+  if (preferred === null) { const route = enabled.find(item => !["gemini", "systemone"].includes(item.protocol)); return route ? { route, fallback: false } : undefined; }
   const exact = enabled.find(route => route.protocol === preferred);
   if (exact) return { route: exact, fallback: false };
-  const relaxed = enabled.find(route => route.protocol !== "gemini");
+  const relaxed = enabled.find(route => !["gemini", "systemone"].includes(route.protocol));
   return relaxed ? { route: relaxed, fallback: true } : undefined;
 }

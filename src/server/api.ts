@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { db, ProviderSchema, RouteSchema, ClientSchema, TrafficSchema, PreferenceSchema, AssetSchema, SessionSchema, AuditSchema, record, audit, setting, saveSetting, RunSchema, McpSchema, RunEventSchema, ApprovalSchema, SourceSchema, McpCallSchema, McpRevisionSchema, JobSchema } from "./store";
 import { ApiError, readJson, requireAdmin, encrypt, decrypt, hash, newClientKey, validProviderUrl, secureEqual, sessionCookie } from "./security";
-import { adminToken, address, version, startedAt } from "./config";
+import { adminToken, address, version, apiVersion, startedAt } from "./config";
 import { probeProvider } from "./providers";
 import { submitJob, jobDetail, cancelJob, retryJob, publicJob } from "./jobs";
 import { debugInput,debugAttempts,debugAttemptDetail } from "./playground";
@@ -19,9 +19,9 @@ import { adaptivePolicy, retryPolicy, protocolConversionEnabled, discardReasonin
 import type { Provider, ClientKey, Dashboard, McpConnection } from "../shared/types";
 
 const name = z.string().trim().min(1).max(100);
-const providerInput = z.object({ name, protocol: z.enum(["openai", "anthropic", "gemini"]), baseUrl: z.string().max(2048).transform((value, context) => { try { return validProviderUrl(value); } catch { context.addIssue({ code: "custom", message: "Invalid provider URL" }); return z.NEVER; } }), secret: z.string().max(8192).optional(), enabled: z.boolean().default(true) });
-const routeInput = z.object({ alias: z.string().trim().regex(/^[\w.\-/:]{1,150}$/), protocol: z.enum(["responses", "chat", "messages", "gemini"]),
-  strategy:z.enum(["priority","round_robin","least_active"]).default("priority"), targets: z.array(z.object({ providerId: z.string().uuid(), model: z.string().min(1).max(200), protocol:z.enum(["responses","chat","messages","gemini"]).optional(), weight:z.number().int().min(1).max(100).default(1),priority:z.number().int().min(0).max(100).default(0),maxConcurrent:z.number().int().min(1).max(100).optional() })).min(1).max(5),
+const providerInput = z.object({ name, protocol: z.enum(["openai", "anthropic", "gemini", "typesafe"]), baseUrl: z.string().max(2048).transform((value, context) => { try { return validProviderUrl(value); } catch { context.addIssue({ code: "custom", message: "Invalid provider URL" }); return z.NEVER; } }), secret: z.string().max(8192).optional(), enabled: z.boolean().default(true) });
+const routeInput = z.object({ alias: z.string().trim().regex(/^[\w.\-/:]{1,150}$/), protocol: z.enum(["responses", "chat", "messages", "gemini", "systemone"]),
+  strategy:z.enum(["priority","round_robin","least_active"]).default("priority"), targets: z.array(z.object({ providerId: z.string().uuid(), model: z.string().min(1).max(200), protocol:z.enum(["responses","chat","messages","gemini","systemone"]).optional(), weight:z.number().int().min(1).max(100).default(1),priority:z.number().int().min(0).max(100).default(0),maxConcurrent:z.number().int().min(1).max(100).optional() })).min(1).max(5),
   enabled: z.boolean().default(true), inputPrice: z.number().min(0).max(100000).refine(n => Number(n.toFixed(6)) === n).nullable().default(null), outputPrice: z.number().min(0).max(100000).refine(n => Number(n.toFixed(6)) === n).nullable().default(null),
   cacheReadPrice: z.number().min(0).max(100000).refine(n => Number(n.toFixed(6)) === n).nullable().default(null), cacheWritePrice: z.number().min(0).max(100000).refine(n => Number(n.toFixed(6)) === n).nullable().default(null), cacheWriteLongPrice: z.number().min(0).max(100000).refine(n => Number(n.toFixed(6)) === n).nullable().default(null),
   contextLimit: z.number().int().min(1000).max(4_000_000).default(128000), outputLimit: z.number().int().min(1).max(1_000_000).default(8192) });
@@ -47,7 +47,7 @@ export async function api(request: Request) {
   }
   requireAdmin(request);
   if (path === "/auth/session" && method === "DELETE") return Response.json({ ok: true }, { headers: { "set-cookie": "pgw_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" } });
-  if (path === "/status" && method === "GET") return Response.json({ version, uptime: Date.now() - startedAt, address, database: "sqlite", personalization: await setting("personalization", true), captureBodies: (await capturePolicy()).enabled });
+  if (path === "/status" && method === "GET") return Response.json({ version, apiVersion, uptime: Date.now() - startedAt, address, database: "sqlite", personalization: await setting("personalization", true), captureBodies: (await capturePolicy()).enabled });
   if (path === "/observability" && method === "GET") return Response.json({ ...await capturePolicy(), ...await captureUsage() });
   if (path === "/observability" && method === "PATCH") { const input = z.object({ enabled:z.boolean(), retentionDays:z.number().int().min(1).max(365), maxStageBytes:z.number().int().min(65536).max(64*1024*1024), maxStorageBytes:z.number().int().min(1024*1024).max(5*1024*1024*1024) }).parse(await readJson(request)); return Response.json(await configureCapture(input)); }
   if (path === "/observability/captures" && method === "DELETE") return Response.json(await deleteAllCaptures());
@@ -113,7 +113,7 @@ export async function api(request: Request) {
     const input = routeInput.parse(await readJson(request));
     for (const target of input.targets) {
       const provider = await get(ProviderSchema, target.providerId) as Provider;
-      if (target.protocol && provider.protocol !== (target.protocol === "messages" ? "anthropic" : target.protocol === "gemini" ? "gemini" : "openai")) throw new ApiError(400, "protocol_mismatch");
+      if (target.protocol && provider.protocol !== (target.protocol === "messages" ? "anthropic" : target.protocol === "gemini" ? "gemini" : target.protocol === "systemone" ? "typesafe" : "openai")) throw new ApiError(400, "protocol_mismatch");
     }
     const previous = routeMatch ? await get(RouteSchema, routeMatch[1]) : null;
     const duplicate = await db.getRepository(RouteSchema).findOneBy({ alias: input.alias });

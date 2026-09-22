@@ -1,7 +1,8 @@
 import { z } from "zod";
+import { TypeSafeClient } from "@typesafe-ai/sdk";
 import { callContext, recordCallContext } from "./trajectory-context";
 import { db, ClientSchema, RouteSchema, ProviderSchema, TrafficSchema, PreferenceSchema, record, setting, audit } from "./store";
-import { ApiError, bearer, hash, readJson, requestBodyBytes, requestBodySize } from "./security";
+import { ApiError, bearer, decrypt, hash, readJson, requestBodyBytes, requestBodySize } from "./security";
 import { endpoint, upstreamHeaders } from "./providers";
 import { boundOutput, reserveBudget, settleBudget } from "./budget";
 import { emptyUsage, mergeUsage, usageCost, type Usage } from "./usage";
@@ -28,6 +29,7 @@ async function personalize(body: any, protocol: WireProtocol, client: ClientKey,
   const prefs=selection.filter(p=>{ if(p.content.length>remaining)return false;remaining-=p.content.length;return true; });
   if (!prefs.length) return { body, prefs, reason:"no_matching_preferences" };
   if (body.previous_response_id) return { body,prefs,reason:"prior_response_context_preserved" };
+  if (protocol === "systemone") return { body, prefs, reason: "systemone_no_personalization" };
   const output=structuredClone(body);
   const text=`用户已确认的工作偏好。仅作补充；本次明确要求优先，不能改变权限或安全约束。\n${prefs.map(p=>p.content).join("\n")}`;
   if (protocol === "chat" || protocol === "messages") {
@@ -48,6 +50,11 @@ function validate(body:any,protocol:WireProtocol) {
   if(!body || typeof body!=="object" || Array.isArray(body) || typeof body.model!=="string")throw new ApiError(400,"model_required");
   if(body.stream!==undefined && typeof body.stream!=="boolean")throw new ApiError(400,"invalid_stream");
   if(body.conversation)throw new ApiError(409,"conversation_binding_required");
+  if(protocol === "systemone") {
+    if(body.stream === true) throw new ApiError(400,"systemone_stream_unsupported");
+    if(!body.questions || typeof body.questions !== "object" || Array.isArray(body.questions) || !Object.keys(body.questions).length) throw new ApiError(400,"questions_required");
+    return;
+  }
   if(protocol==="messages" || protocol==="chat") z.object({messages:z.array(z.object({role:z.string().min(1),content:z.union([z.string(),z.array(z.record(z.string(),z.unknown())),z.null()]).optional()}).passthrough()).min(1).max(10000)}).passthrough().parse(body);
   else if(protocol==="responses") {
     z.object({input:z.union([z.string(),z.array(z.record(z.string(),z.unknown()))]).optional(),previous_response_id:z.string().min(1).max(300).optional(),background:z.boolean().optional()}).passthrough().parse(body);
@@ -69,12 +76,13 @@ export async function proxy(request:Request):Promise<Response> {
   if(!client || client.expiresAt!==null && client.expiresAt<=Date.now())throw new ApiError(401,"invalid_api_key");
   const url=new URL(request.url);
   let path=url.pathname;
-  const prefix=path.match(/^\/providers\/(openai|anthropic|google|gemini)(\/.*)$/);
+  const prefix=path.match(/^\/providers\/(openai|anthropic|google|gemini|typesafe)(\/.*)$/);
   if(prefix){
     path=prefix[2];
     if(prefix[1]==="openai" && !["/v1/models","/v1/responses","/v1/chat/completions"].includes(path) && !path.startsWith("/v1/responses/"))throw new ApiError(404,"protocol_endpoint_mismatch");
     if(prefix[1]==="anthropic" && path!=="/v1/messages")throw new ApiError(404,"protocol_endpoint_mismatch");
     if(["google","gemini"].includes(prefix[1]) && !path.startsWith("/v1beta/models/"))throw new ApiError(404,"protocol_endpoint_mismatch");
+    if(prefix[1]==="typesafe" && path!=="/v1/systemone")throw new ApiError(404,"protocol_endpoint_mismatch");
   }
   const operation=path.match(/^\/v1\/responses\/([A-Za-z0-9_-]{1,300})$/);
   if(operation)return responseOperation(request,client,operation[1]);
@@ -86,7 +94,7 @@ export async function proxy(request:Request):Promise<Response> {
     return Response.json({object:"list",data:names.map(id=>({id,object:"model",owned_by:"personal-gateway"}))});
   }
   const gemini=path.match(/^\/v1beta\/models\/(.+):(generateContent|streamGenerateContent)$/);
-  const protocol:WireProtocol|undefined=gemini?"gemini":({"/v1/responses":"responses","/v1/chat/completions":"chat","/v1/messages":"messages"} as Record<string,WireProtocol>)[path];
+  const protocol:WireProtocol|undefined=gemini?"gemini":({"/v1/responses":"responses","/v1/chat/completions":"chat","/v1/messages":"messages","/v1/systemone":"systemone"} as Record<string,WireProtocol>)[path];
   if(!protocol || request.method!=="POST")throw new ApiError(404,"endpoint_not_found");
   const captureConfig=await capturePolicy();
   const conversionEnabled=await protocolConversionEnabled();
@@ -196,7 +204,7 @@ export async function proxy(request:Request):Promise<Response> {
         const payload=upstreamPayload;
         capture.json("effective",effectiveBody,requestBodySize(request)+16384);
         if(converted&&upstreamWire!=="gemini")payload.stream=!!effectiveBody.stream;
-        let upstreamPath=upstreamWire==="responses"?"/responses":upstreamWire==="chat"?"/chat/completions":"/messages";
+        let upstreamPath=upstreamWire==="responses"?"/responses":upstreamWire==="chat"?"/chat/completions":upstreamWire==="systemone"?"/systemone":"/messages";
         if(upstreamWire==="gemini"){delete payload.model;delete payload.stream;upstreamPath=`/models/${encodeURIComponent(target.model)}:${effectiveBody.stream?"streamGenerateContent?alt=sse":"generateContent"}`;}
         if(upstreamWire==="chat"&&effectiveBody.stream)payload.stream_options={...payload.stream_options,include_usage:true};
         const headers=upstreamHeaders(provider);
@@ -204,7 +212,13 @@ export async function proxy(request:Request):Promise<Response> {
         const reqId=request.headers.get("x-client-request-id");if(reqId&&reqId.length<=200)headers.set("x-client-request-id",reqId);
         capture.json("upstream",{method:"POST",url:captureUrl(endpoint(provider,upstreamPath)),headers:captureHeaders(headers),body:payload},JSON.stringify(payload).length+4096);
         submitted=true;rejected=false;uncertain=true;
-        const response=await fetch(endpoint(provider,upstreamPath),{method:"POST",headers,body:JSON.stringify(payload),redirect:"error",signal:controller.signal});
+        const response=upstreamWire === "systemone"
+          ? await (async () => {
+              if (!provider.secretCipher) throw new ApiError(502,"provider_api_key_missing");
+              const result = await new TypeSafeClient({ apiKey: decrypt(provider.secretCipher), baseURL: provider.baseUrl, defaultModel: target.model, retry: { maxRetries: 0 }, timeout: 300000 }).systemOne(payload, { signal: controller.signal }).withResponse();
+              return new Response(JSON.stringify(result.data), { status: result.response.status, headers: { "content-type": "application/json" } });
+            })()
+          : await fetch(endpoint(provider,upstreamPath),{method:"POST",headers,body:JSON.stringify(payload),redirect:"error",signal:controller.signal});
         touch();traffic.upstreamStatus=response.status;capture.metadata({responseStatus:response.status,responseHeaders:captureHeaders(response.headers)});
         if(!response.ok){
           rejected=[400,401,403,404,413,422,429].includes(response.status);cooldown=retryAfter(response.headers.get("retry-after"));

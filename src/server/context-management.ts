@@ -36,6 +36,7 @@ function trimHistory(body: any, protocol: WireProtocol, budget: number) {
   return { body: next, compressed: removed > 0, removed };
 }
 export async function applyAdaptiveContext(body: any, protocol: WireProtocol, route: ModelRoute, provider: Provider, model: string) {
+  if (protocol === "systemone") return { body, compressed: false, removed: 0, limit: route.contextLimit };
   const policy = await adaptivePolicy();
   if (!policy.enabled || !policy.compressionEnabled) return { body, compressed: false, removed: 0, limit: null as number | null, reason: "disabled" };
   const learned = await atomic(database => database.query("SELECT learnedLimit FROM adaptive_context_limits WHERE providerId=? AND model=? AND protocol=?").get(provider.id, model, protocol) as { learnedLimit: number | null } | null);

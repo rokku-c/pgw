@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import { TypeSafeClient } from "@typesafe-ai/sdk";
 import type { Provider } from "../shared/types";
 import { decrypt } from "./security";
 import { db, ProviderSchema } from "./store";
@@ -24,6 +25,11 @@ export async function probeProvider(provider: Provider) {
   const start = performance.now();
   const task = Effect.tryPromise({
     try: async () => {
+      if (provider.protocol === "typesafe") {
+        if (!provider.secretCipher) throw new Error("API key required");
+        const client = new TypeSafeClient({ apiKey: decrypt(provider.secretCipher), baseURL: provider.baseUrl, retry: { maxRetries: 0 }, timeout: 10000 });
+        return (await client.models.list()).map(model => model.name).slice(0, 300);
+      }
       const response = await fetch(endpoint(provider, "/models"), {
         headers: upstreamHeaders(provider), redirect: "error", signal: AbortSignal.timeout(10000),
       });

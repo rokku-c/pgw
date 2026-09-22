@@ -11,6 +11,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invali
 export const address = `http://127.0.0.1:${port}`;
 export const startedAt = Date.now();
 export const version = "0.1.0";
+export const apiVersion = 1;
 
 function persistentSecret(name: string, length: number): Buffer {
   const path = join(home, name);

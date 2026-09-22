@@ -33,6 +33,10 @@ export async function budgetSummary(kind: "client" | "run", id: string) {
   return atomic(db => totals(db, `${kind === "run" ? "runId" : "clientId"} = ?`, [id]));
 }
 export function boundOutput(body: any, route: ModelRoute) {
+  if (route.protocol === "systemone") {
+    if (body.stream === true) throw new ApiError(400, "systemone_stream_unsupported");
+    return route.outputLimit;
+  }
   const field = route.protocol === "responses" ? "max_output_tokens" : route.protocol === "messages" ? "max_tokens" : route.protocol === "chat" ? (body.max_completion_tokens !== undefined ? "max_completion_tokens" : "max_tokens") : "maxOutputTokens";
   const source = route.protocol === "gemini" ? body.generationConfig || {} : body;
   const amount = source[field] ?? route.outputLimit;

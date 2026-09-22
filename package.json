@@ -1,7 +1,6 @@
 {
   "name": "personal-gateway",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "bin": {
     "pgw": "./src/cli.ts"
@@ -20,6 +19,7 @@
     "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/server": "2.0.0",
     "@phosphor-icons/react": "2.1.10",
+    "@typesafe-ai/sdk": "0.6.0",
     "effect": "3.22.2",
     "radix-ui": "1.6.7",
     "react": "19.3.0",
@@ -33,5 +33,9 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "typescript": "7.0.2"
-  }
+  },
+  "files": [
+    "src",
+    "README.md"
+  ]
 }
