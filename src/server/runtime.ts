@@ -68,7 +68,7 @@ async function execute(control: ActiveRun, message?: string) {
   const run = control.run;
   const began = Date.now();
   let clientId: string | undefined;
-  let turnToolActivity = false;
+  let toolResultReceived = false;
   let outputDirty = false;
   let saving = Promise.resolve();
   const remaining = run.timeoutSeconds * 1000 - run.elapsedMs;
@@ -94,10 +94,7 @@ async function execute(control: ActiveRun, message?: string) {
       output: text => { run.output = (run.output + text).slice(-500000); outputDirty = true; },
       identity: async (session, turn = null) => { await update(run, { nativeSessionId: session, nativeTurnId: turn }); },
       event: async (kind, detail) => {
-        if (kind === "native.item" || kind === "native.tool") {
-          const type = String(detail.type || "").toLowerCase();
-          if (/(tool|command|function|mcp|computer|file)/.test(type)) turnToolActivity = true;
-        }
+        if (kind === "native.tool" && detail.phase === "result") toolResultReceived = true;
         if (kind === "native.request_resolved") {
           for (const [id, approval] of control.approvals) if (String(approval.nativeId) === String(detail.requestId)) {
             control.approvals.delete(id); await db.getRepository(ApprovalSchema).update(id, { status: "expired", updatedAt: Date.now() });
@@ -115,10 +112,11 @@ async function execute(control: ActiveRun, message?: string) {
       const funds = await budgetSummary("run", run.id);
       if (run.controls.budgetMicros !== null && funds.costMicros + funds.heldMicros >= run.controls.budgetMicros) { control.stop = { status: "budget_exhausted", reason: "cost_limit" }; break; }
       if (run.controls.tokenLimit !== null && funds.tokens + funds.heldTokens >= run.controls.tokenLimit) { control.stop = { status: "budget_exhausted", reason: "token_limit" }; break; }
-      turnToolActivity = false;
+      toolResultReceived = false;
       await update(run, { turnCount: run.turnCount + 1, status: "running" });
       await event(run, "turn.started", { input: next });
       const result = await control.adapter.turn(next);
+      await control.adapter.drain();
       await event(run, "turn.completed", { status: result.status, error: result.error ?? null });
       if (control.stop) break;
       if (control.approvals.size) { control.stop = { status: "blocked", reason: "approval_unresolved" }; break; }
@@ -132,8 +130,8 @@ async function execute(control: ActiveRun, message?: string) {
       await event(run, "goal.evaluated", { mode: run.controls.mode, evidence: proof.evidence });
       if (run.controls.mode === "turn" || proof.complete) { control.stop = { status: "completed", reason: run.controls.mode === "turn" ? "turn_completed" : "criteria_satisfied" }; break; }
       if (!run.controls.completionFiles.length) {
-        const decision = decideContinuation({ mode: run.controls.coordinatorMode, turnStatus: result.status, hasToolActivity: turnToolActivity, completionComplete: proof.complete, approvalsPending: control.approvals.size > 0, userStopped: !!control.stop });
-        await event(run, "coordinator.decided", { ...decision, hasToolActivity: turnToolActivity });
+        const decision = decideContinuation({ mode: run.controls.coordinatorMode, turnStatus: result.status, hasToolActivity: toolResultReceived, completionComplete: proof.complete, approvalsPending: control.approvals.size > 0, userStopped: !!control.stop });
+        await event(run, "coordinator.decided", { ...decision, hasToolActivity: toolResultReceived });
         if (decision.decision === "continue") { next = decision.message; continue; }
         control.stop = { status: "waiting_for_input", reason: decision.reason === "tool_result_needs_review" ? "coordinator_suggested_continuation" : "completion_confirmation_required" };
         break;

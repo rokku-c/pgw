@@ -30,6 +30,12 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
 }
 
 if (import.meta.main) {
-  console.assert(decideContinuation({ mode: "continue", turnStatus: "completed", hasToolActivity: true, completionComplete: false, approvalsPending: false, userStopped: false }).decision === "continue");
-  console.assert(decideContinuation({ mode: "continue", turnStatus: "completed", hasToolActivity: false, completionComplete: false, approvalsPending: false, userStopped: false }).decision === "stop");
+  const base = { turnStatus: "completed" as const, hasToolActivity: true, completionComplete: false, approvalsPending: false, userStopped: false };
+  console.assert(decideContinuation({ ...base, mode: "continue" }).decision === "continue");
+  console.assert(decideContinuation({ ...base, mode: "suggest" }).decision === "suggest");
+  console.assert(decideContinuation({ ...base, mode: "off" }).reason === "coordinator_disabled");
+  console.assert(decideContinuation({ ...base, mode: "continue", hasToolActivity: false }).reason === "no_tool_activity");
+  console.assert(decideContinuation({ ...base, mode: "continue", approvalsPending: true }).reason === "approval_pending");
+  console.assert(decideContinuation({ ...base, mode: "continue", userStopped: true }).reason === "user_stopped");
+  console.assert(decideContinuation({ ...base, mode: "continue", completionComplete: true }).reason === "criteria_satisfied");
 }
