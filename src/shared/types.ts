@@ -1,5 +1,9 @@
 export type Protocol = "openai" | "anthropic" | "gemini";
 export type WireProtocol = "responses" | "chat" | "messages" | "gemini";
+/** 互转时被丢弃的内容。`count` 在能界定边界的协议里是真实块数，chat/gemini 的匿名增量每类型至多记 1。 */
+export interface ConversionDrop { type: string; count: number }
+/** 互转降级开关：`reasoning` 丢弃推理块，`hosted` 忽略托管工具声明；两者默认为假时转换行为与关闭前逐字节相同。 */
+export interface ConversionSink { reasoning: boolean; hosted: boolean; dropped: ConversionDrop[] }
 export type Page = "overview" | "observability" | "models" | "traffic" | "sessions" | "registry" | "persona" | "runs" | "settings" | "jobs" | "playground";
 export interface RecordBase { id: string; createdAt: number; updatedAt: number }
 export interface Provider extends RecordBase {

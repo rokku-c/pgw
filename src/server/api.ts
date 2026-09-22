@@ -14,7 +14,7 @@ import { startRun, stopRun, resumeRun, steerRun, completeRun, decideApproval } f
 import { probeMcp, callMcp, executeMcp, validateGrants, decideMcpCall, cancelMcpCall, publicMcpCall, revokeMcpAccess } from "./mcp";
 import { budgetSummary } from "./budget";
 import { capturePolicy, configureCapture, inspectCapture, captureStage, deleteCapture, deleteAllCaptures, inspectTrajectory, compareTrajectory, trajectorySessions, trajectoryNodes, trajectoryNodeDetail, contextSnapshots, inspectContextSnapshot, compareContextSnapshots, deleteContextSnapshot } from "./observability";
-import { adaptivePolicy, retryPolicy, protocolConversionEnabled } from "./context-management";
+import { adaptivePolicy, retryPolicy, protocolConversionEnabled, discardReasoningEnabled, ignoreHostedToolsEnabled } from "./context-management";
 import type { Provider, ClientKey, Dashboard, McpConnection } from "../shared/types";
 
 const name = z.string().trim().min(1).max(100);
@@ -299,15 +299,17 @@ export async function api(request: Request) {
       return Response.json({ ...result, messages: result.events.filter(e => e.text && ["user", "assistant"].includes(e.role)).map(e => ({ role: e.role, text: e.text })), partial: result.next !== null || result.session.status !== "indexed" });
     }
   }
-  if (path === "/settings" && method === "GET") return Response.json({ personalization: await setting("personalization", true), observability: await capturePolicy(), adaptiveContext: await adaptivePolicy(), protocolConversion: await protocolConversionEnabled(), transparentRetry: await retryPolicy() });
+  if (path === "/settings" && method === "GET") return Response.json({ personalization: await setting("personalization", true), observability: await capturePolicy(), adaptiveContext: await adaptivePolicy(), protocolConversion: await protocolConversionEnabled(), discardReasoning: await discardReasoningEnabled(), ignoreHostedTools: await ignoreHostedToolsEnabled(), transparentRetry: await retryPolicy() });
   if (path === "/settings" && method === "PATCH") {
-    const input = z.object({ personalization: z.boolean().optional(), observability: z.object({ enabled:z.boolean(), retentionDays:z.number().int().min(1).max(365), maxStageBytes:z.number().int().min(65536).max(16*1024*1024), maxStorageBytes:z.number().int().min(1024*1024).max(4*1024*1024*1024) }).optional(), adaptiveContext: z.object({enabled:z.boolean(),learn:z.boolean(),compressionEnabled:z.boolean(),compressionRatio:z.number().min(.5).max(1),maxTokens:z.number().int().min(256).max(4_000_000).nullable(),awarenessPrompt:z.string().max(4000)}).optional(), protocolConversion:z.boolean().optional(), transparentRetry:z.object({enabled:z.boolean(),maxRetries:z.number().int().min(0).max(100),backoffMs:z.number().int().min(0).max(60000),statuses:z.array(z.number().int().min(400).max(599)).max(30)}).optional() }).refine(value => Object.values(value).some(item => item !== undefined)).parse(await readJson(request));
+    const input = z.object({ personalization: z.boolean().optional(), observability: z.object({ enabled:z.boolean(), retentionDays:z.number().int().min(1).max(365), maxStageBytes:z.number().int().min(65536).max(16*1024*1024), maxStorageBytes:z.number().int().min(1024*1024).max(4*1024*1024*1024) }).optional(), adaptiveContext: z.object({enabled:z.boolean(),learn:z.boolean(),compressionEnabled:z.boolean(),compressionRatio:z.number().min(.5).max(1),maxTokens:z.number().int().min(256).max(4_000_000).nullable(),awarenessPrompt:z.string().max(4000)}).optional(), protocolConversion:z.boolean().optional(), discardReasoning:z.boolean().optional(), ignoreHostedTools:z.boolean().optional(), transparentRetry:z.object({enabled:z.boolean(),maxRetries:z.number().int().min(0).max(100),backoffMs:z.number().int().min(0).max(60000),statuses:z.array(z.number().int().min(400).max(599)).max(30)}).optional() }).refine(value => Object.values(value).some(item => item !== undefined)).parse(await readJson(request));
     if(input.personalization !== undefined) await saveSetting("personalization", input.personalization);
     if(input.observability) await configureCapture(input.observability);
     if(input.adaptiveContext) await saveSetting("adaptiveContext", input.adaptiveContext);
     if(input.protocolConversion !== undefined) await saveSetting("protocolConversion", input.protocolConversion);
+    if(input.discardReasoning !== undefined) await saveSetting("discardReasoning", input.discardReasoning);
+    if(input.ignoreHostedTools !== undefined) await saveSetting("ignoreHostedTools", input.ignoreHostedTools);
     if(input.transparentRetry) await saveSetting("transparentRetry", input.transparentRetry);
-    await audit("settings.updated", "settings", input); return Response.json({ personalization: await setting("personalization", true), observability: await capturePolicy(), adaptiveContext: await adaptivePolicy(), protocolConversion: await protocolConversionEnabled(), transparentRetry: await retryPolicy() });
+    await audit("settings.updated", "settings", input); return Response.json({ personalization: await setting("personalization", true), observability: await capturePolicy(), adaptiveContext: await adaptivePolicy(), protocolConversion: await protocolConversionEnabled(), discardReasoning: await discardReasoningEnabled(), ignoreHostedTools: await ignoreHostedToolsEnabled(), transparentRetry: await retryPolicy() });
   }
   const publicMcp = (item: McpConnection) => { const { envCipher, headersCipher, ...rest } = item; return { ...rest, hasEnv: !!envCipher, hasHeaders: !!headersCipher }; };
   if (path === "/mcp" && method === "GET") return Response.json((await db.getRepository(McpSchema).find({ order: { createdAt: "DESC" } })).map(publicMcp));

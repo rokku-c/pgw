@@ -59,7 +59,7 @@
 | --- | --- |
 | T01 | 三类 Session 可分页发现、身份不混淆；扫描源离线可见状态 |
 | T02 | 原生/托管 turn、step、子会话分支可定位，derived 标记可见 |
-| T03 | 四协议 JSON/SSE 的文本、reasoning、工具参数/结果正确、不重复、不漏未知内容 |
+| T03 | 四协议 JSON/SSE 的文本、reasoning、工具参数/结果正确、不重复、不漏未知内容。互转降级开关开启后，被丢弃的 reasoning 不再出现在客户端可见输出里：判读「不漏」以 capture 的 response（原始上游流）阶段为准，丢弃明细记入该次尝试的路由决策 |
 | T04 | 五阶段事实可读，原始请求不被 boundOutput/个性化变异，错误输出不冒充成功输出 |
 | T05 | ToolCall 以 call ID 关联，审批与执行结果有独立证据；并发工具不串联 |
 | T06 | explicit/derived/candidate 关联有作用域、依据和来源；误匹配不合并 |

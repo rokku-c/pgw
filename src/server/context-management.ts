@@ -7,6 +7,10 @@ export const retryDefaults: RetryPolicy = { enabled: false, maxRetries: 3, backo
 export async function adaptivePolicy() { return (await import("./store")).setting<AdaptiveContextPolicy>("adaptiveContext", adaptiveDefaults); }
 export async function retryPolicy() { return (await import("./store")).setting<RetryPolicy>("transparentRetry", retryDefaults); }
 export async function protocolConversionEnabled() { return (await import("./store")).setting<boolean>("protocolConversion", true); }
+/** 互转时丢弃推理块而非拒绝。默认关闭，保持"无法保持的语义必须明确反馈"。 */
+export async function discardReasoningEnabled() { return (await import("./store")).setting<boolean>("discardReasoning", false); }
+/** 互转时忽略托管工具声明而非拒绝。默认关闭，与推理开关相互独立。 */
+export async function ignoreHostedToolsEnabled() { return (await import("./store")).setting<boolean>("ignoreHostedTools", false); }
 function estimate(value: unknown) { return Math.max(1, Math.ceil(Buffer.byteLength(JSON.stringify(value)) / 4)); }
 function addPrompt(body: any, protocol: WireProtocol, prompt: string) {
   if (!prompt) return body;

@@ -5,13 +5,16 @@ import { ApiError, bearer, hash, readJson, requestBodyBytes, requestBodySize } f
 import { endpoint, upstreamHeaders } from "./providers";
 import { boundOutput, reserveBudget, settleBudget } from "./budget";
 import { emptyUsage, mergeUsage, usageCost, type Usage } from "./usage";
-import { convertRequest, convertResponse } from "./protocols";
+import { convertRequest, convertResponse, isReasoningDrop } from "./protocols";
 import { StreamConversion } from "./stream-conversion";
 import { EventStreamParser, type ServerEvent } from "./event-stream";
 import { balancedTargets, beginRouteSession, frozenPreferences, pinRoute, recordResponse, releaseRouteSession, unpinRejectedRoute, responseBinding, providerFingerprint, circuitPermit, circuitResult, retryAfter, type FrozenPreference, type RouteSession } from "./routing";
 import { beginCapture, capturePolicy, captureHeaders, captureUrl, type RequestCapture } from "./observability";
-import { applyAdaptiveContext, recordAdaptiveObservation, protocolConversionEnabled, retryPolicy } from "./context-management";
-import type { ClientKey, ModelRoute, Traffic, WireProtocol, Provider, Target } from "../shared/types";
+import { applyAdaptiveContext, recordAdaptiveObservation, protocolConversionEnabled, discardReasoningEnabled, ignoreHostedToolsEnabled, retryPolicy } from "./context-management";
+import { upstreamWireOf } from "../shared/endpoints";
+import type { ClientKey, ModelRoute, Traffic, WireProtocol, Provider, Target, ConversionSink } from "../shared/types";
+/** 把丢弃明细写成路由决策：推理类与托管工具类分开记，便于在请求查看里区分。 */
+const dropDecisions=(sink:ConversionSink,target:string)=>sink.dropped.map(drop=>({action:isReasoningDrop(drop.type)?"discard_reasoning":"discard_hosted",target,reason:`${drop.type}×${drop.count}`}));
 
 export function extractUsage(body: any) { return mergeUsage(emptyUsage(),body,body?.usageMetadata?"gemini":"responses"); }
 async function personalize(body: any, protocol: WireProtocol, client: ClientKey, session: RouteSession | null) {
@@ -81,6 +84,9 @@ export async function proxy(request:Request):Promise<Response> {
   if(!protocol || request.method!=="POST")throw new ApiError(404,"endpoint_not_found");
   const captureConfig=await capturePolicy();
   const conversionEnabled=await protocolConversionEnabled();
+  // 两个降级开关只在真正需要转换时读取，避免同协议透传路径多一次设置查询。
+  const discardReasoning=conversionEnabled&&await discardReasoningEnabled();
+  const ignoreHostedTools=conversionEnabled&&await ignoreHostedToolsEnabled();
   const retryConfig=await retryPolicy();
   const original=await readJson(request,16*1024*1024,captureConfig.enabled);
   if(gemini && original && typeof original==="object" && !Array.isArray(original)){ original.model=decodeURIComponent(gemini[1]);original.stream=gemini[2]==="streamGenerateContent"; }
@@ -107,16 +113,19 @@ export async function proxy(request:Request):Promise<Response> {
       const target=targets[targetIndex%targets.length];
       const provider=await db.getRepository(ProviderSchema).findOneBy({id:target.providerId,enabled:true});
       if(!provider){ decisions.push({action:"skip",target:target.providerId,reason:"provider_disabled"});continue; }
-      const upstreamWire:WireProtocol=target.protocol||(provider.protocol==="anthropic"?"messages":provider.protocol==="gemini"?"gemini":protocol==="responses"?"responses":"chat");
+      const upstreamWire:WireProtocol=upstreamWireOf(protocol,target.protocol,provider.protocol);
       const converted=upstreamWire!==protocol;
       if(converted&&!conversionEnabled){lastError=new ApiError(409,"protocol_conversion_disabled");decisions.push({action:"skip",target:provider.id,reason:"protocol_conversion_disabled"});continue;}
       const managed=await applyAdaptiveContext(body,protocol,route,provider,target.model);
       if(managed.compressed)decisions.push({action:"context_compress",target:provider.id,reason:`${managed.removed}:${managed.limit}`});
       const effectiveBody=managed.body;
+      // 一次尝试一个 sink：请求方向的丢弃随 traffic 创建落库，随后清空，留给 finish() 记录响应方向的丢弃。
+      const sink:ConversionSink={reasoning:discardReasoning,hosted:ignoreHostedTools,dropped:[]};
       let upstreamPayload:any;
-      try{upstreamPayload=converted?convertRequest(effectiveBody,protocol,upstreamWire,target.model):{...effectiveBody,model:target.model};}
+      try{upstreamPayload=converted?convertRequest(effectiveBody,protocol,upstreamWire,target.model,sink):{...effectiveBody,model:target.model};}
       catch(error){if(error instanceof ApiError){lastError=error;decisions.push({action:"skip",target:provider.id,reason:error.code});continue;}throw error;}
       if(converted)decisions.push({action:"convert",target:provider.id,reason:`${protocol}→${upstreamWire}:${body.stream?"stream":"json"}`});
+      if(sink.dropped.length){decisions.push(...dropDecisions(sink,provider.id));sink.dropped.length=0;}
       if(session?.providerFingerprint && session.providerFingerprint!==providerFingerprint(provider))throw new ApiError(409,"pinned_provider_changed");
       const circuit=await circuitPermit(provider,target.model);
       decisions.push({action:circuit.allowed?"select":"skip",target:provider.id,reason:session?.providerId?`session_pinned:${circuit.reason}`:circuit.reason});
@@ -142,6 +151,9 @@ export async function proxy(request:Request):Promise<Response> {
         if(finishPromise)return finishPromise;
         finishPromise=(async()=>{
           clearTimeout(timeout);clearTimeout(idleTimer);request.signal.removeEventListener("abort",cancel);controller.signal.removeEventListener("abort",aborted);
+          // 响应方向的丢弃在这里统一落库：finishPromise 保证只跑一次，覆盖正常结束、上游错误、流内异常与客户端取消。
+          const flushed=sink.dropped.length>0;
+          if(flushed)traffic.decisions.push(...dropDecisions(sink,provider.id));
           const knownRejected=!submitted||rejected;
           Object.assign(traffic,usage);
           if(knownRejected){traffic.inputTokens=0;traffic.outputTokens=0;traffic.costMicros=0;}
@@ -152,7 +164,7 @@ export async function proxy(request:Request):Promise<Response> {
           await settleBudget(traffic.id,terminal&&status==="completed"?traffic:{inputTokens:null,outputTokens:null,costMicros:null},knownRejected);
           if(terminal && protocol==="responses" && upstreamWire==="responses" && traffic.responseId)await recordResponse(session,traffic.responseId,target,provider,responseStatus,group);
           if(knownRejected)await unpinRejectedRoute(session,group);
-          await db.getRepository(TrafficSchema).update(traffic.id,{status,error,latencyMs:Date.now()-started,firstByteMs:traffic.firstByteMs,firstTokenMs:traffic.firstTokenMs,decodingMs:traffic.decodingMs,upstreamStatus:traffic.upstreamStatus,inputTokens:traffic.inputTokens,outputTokens:traffic.outputTokens,cacheReadTokens:traffic.cacheReadTokens,cacheWriteTokens:traffic.cacheWriteTokens,cacheWriteLongTokens:traffic.cacheWriteLongTokens,reasoningTokens:traffic.reasoningTokens,costMicros:traffic.costMicros,accounting:traffic.accounting,responseId:traffic.responseId,updatedAt:Date.now()});
+          await db.getRepository(TrafficSchema).update(traffic.id,{status,error,latencyMs:Date.now()-started,firstByteMs:traffic.firstByteMs,firstTokenMs:traffic.firstTokenMs,decodingMs:traffic.decodingMs,upstreamStatus:traffic.upstreamStatus,inputTokens:traffic.inputTokens,outputTokens:traffic.outputTokens,cacheReadTokens:traffic.cacheReadTokens,cacheWriteTokens:traffic.cacheWriteTokens,cacheWriteLongTokens:traffic.cacheWriteLongTokens,reasoningTokens:traffic.reasoningTokens,costMicros:traffic.costMicros,accounting:traffic.accounting,responseId:traffic.responseId,...(flushed?{decisions:traffic.decisions}:{}),updatedAt:Date.now()});
           capture.finish(status,error);
           const upstreamFailure=error && error!=="client_cancelled" && ![400,401,403,404,413,422].includes(traffic.upstreamStatus||0)?error:null;
           await recordAdaptiveObservation(traffic,provider,target.model,protocol,error);
@@ -204,7 +216,7 @@ export async function proxy(request:Request):Promise<Response> {
           traffic.firstTokenMs=traffic.firstByteMs;
           terminal=!['queued','in_progress'].includes(responseStatus);
           if(!terminal)throw new ApiError(502,"unexpected_background_response");
-          const answer=converted?convertResponse(parsed,upstreamWire,protocol,route.alias):parsed;
+          const answer=converted?convertResponse(parsed,upstreamWire,protocol,route.alias,sink):parsed;
           capture.chunk("output",converted?new TextEncoder().encode(JSON.stringify(answer)):bytes);
           await finish(responseStatus==="failed"?"failed":"completed",responseStatus==="failed"?"upstream_response_failed":null);
           if(converted)return new Response(JSON.stringify(answer),{status:response.status,headers:{"content-type":"application/json","x-pgw-request-id":group,"x-pgw-attempt-id":traffic.id,"x-pgw-conversion":"json"}});
@@ -213,7 +225,7 @@ export async function proxy(request:Request):Promise<Response> {
         if(!response.body||!response.headers.get("content-type")?.includes("text/event-stream")){await response.body?.cancel();throw new ApiError(502,"invalid_upstream_stream");}
         reader=response.body.getReader();
         let produced=false;
-        const conversion=converted?new StreamConversion(upstreamWire,protocol,route.alias,chunk=>{produced=true;if(traffic.firstTokenMs===null)traffic.firstTokenMs=Date.now()-started;capture.chunk("output",chunk);output?.enqueue(chunk);}):null;
+        const conversion=converted?new StreamConversion(upstreamWire,protocol,route.alias,chunk=>{produced=true;if(traffic.firstTokenMs===null)traffic.firstTokenMs=Date.now()-started;capture.chunk("output",chunk);output?.enqueue(chunk);},sink):null;
         const markToken=()=>{if(traffic.firstTokenMs===null)traffic.firstTokenMs=Date.now()-started;};
         const parse=(event:ServerEvent)=>{
           if(conversion){conversion.accept(event);usage=conversion.usage;terminal=conversion.complete;responseStatus=conversion.status;traffic.responseId=protocol==="responses"?conversion.id:conversion.upstreamId;return;}

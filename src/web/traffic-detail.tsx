@@ -5,7 +5,7 @@ import { api, useResource, money, number } from "./api";
 import { Modal, Badge, Confirm, Header, Empty, Copy } from "./components";
 import type { Traffic } from "../shared/types";
 import { TrajectoryInspector, TrajectoryRaw, TrajectoryDiff } from "./trajectory";
-const actionKeys={select:"routing.action.select",skip:"routing.action.skip",fallback:"routing.action.fallback",convert:"routing.action.convert",personalization:"routing.action.personalize"} as const;
+const actionKeys={select:"routing.action.select",skip:"routing.action.skip",fallback:"routing.action.fallback",convert:"routing.action.convert",personalization:"routing.action.personalize",discard_reasoning:"routing.action.discardReasoning",discard_hosted:"routing.action.discardHosted"} as const;
 
 export function TrafficDetail({id,close}:{id:string;close:()=>void}){
   const trace=useResource<{request:Traffic;attempts:Traffic[];capture:import("../shared/types").CaptureInfo|null;sessionRequests:Traffic[]}>(`/traffic/${id}`,1500);

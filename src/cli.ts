@@ -13,8 +13,9 @@ import { parseSessionLine } from "./server/session-parser";
 import { safePackagePath,skillMetadata } from "./server/packages";
 import { withinSource } from "./server/session-files";
 import { mcpAlias } from "./server/mcp";
-import { protocolBase } from "./shared/endpoints";
-import type { ModelRoute, PublicClient } from "./shared/types";
+import { protocolBase, upstreamWireOf } from "./shared/endpoints";
+import { pickRoute } from "./shared/routes";
+import type { ModelRoute, PublicClient, PublicProvider, WireProtocol } from "./shared/types";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
@@ -85,14 +86,25 @@ async function doctor() {
   console.log(`✓ Gateway ${status.version}\n✓ SQLite\n✓ Authentication\n${routes.length ? "✓" : "○"} ${routes.length} routes`);
   for (const name of ["claude", "codex", "pi"]) console.log(`${Bun.which(name) ? "✓" : "○"} ${name}`);
 }
+/** 回退到标签不同的路由时给出准确反馈。只在"全部可用目标都需转换、且互转已关闭"这个可证伪的前提下报错，避免误杀混合目标池。 */
+async function noteConvertedRoute(route: ModelRoute, inbound: WireProtocol) {
+  const [providers, settings] = await Promise.all([request<PublicProvider[]>("/providers"), request<{ protocolConversion: boolean }>("/settings")]);
+  const usable = route.targets.flatMap(target => { const provider = providers.find(item => item.id === target.providerId && item.enabled); return provider ? [{ target, provider }] : []; });
+  const converting = usable.filter(item => upstreamWireOf(inbound, item.target.protocol, item.provider.protocol) !== inbound);
+  if (!converting.length) return;
+  if (converting.length === usable.length && !settings.protocolConversion) throw new Error(`Route ${route.alias} needs protocol conversion, but it is disabled: ${address}`);
+  console.error(`pgw: ${route.alias} is a ${route.protocol} route; the ${inbound} entry converts it before the upstream.`);
+}
 async function wrap(agent: "claude" | "codex" | "pi", raw: string[]) {
   const executable = Bun.which(agent);
   if (!executable) throw new Error(`${agent}: executable not found`);
   await ensureServer();
   const routes = await request<ModelRoute[]>("/routes");
   const protocol = agent === "claude" ? "messages" : agent === "codex" ? "responses" : null;
-  const route = routes.find(r => r.enabled && (!protocol || r.protocol === protocol) && (!process.env.PGW_MODEL || r.alias === process.env.PGW_MODEL));
-  if (!route) throw new Error(`Configure a ${protocol || "compatible"} route: ${address}`);
+  const pick = pickRoute(routes, protocol, process.env.PGW_MODEL);
+  if (!pick) throw new Error(`Configure a ${protocol || "compatible"} route: ${address}`);
+  const route = pick.route;
+  if (pick.fallback && protocol) await noteConvertedRoute(route, protocol);
   const workspace = await realpath(process.cwd());
   const access = accessId ? (await request<PublicClient[]>("/clients")).find(c => c.id === accessId && c.enabled && (c.expiresAt === null || c.expiresAt > Date.now())) : undefined;
   if (accessId && !access) throw new Error("MCP access not found");
@@ -234,8 +246,11 @@ try {
     if (!["claude", "codex", "pi"].includes(args[1]) || !values.goal) throw new Error("pgw run codex|claude|pi --goal TEXT [--model ALIAS] [--workspace PATH]");
     await ensureServer();
     const routes = await request<ModelRoute[]>("/routes");
-    const route = routes.find(r => r.enabled && (args[1] === "pi" ? r.protocol !== "gemini" : r.protocol === (args[1] === "claude" ? "messages" : "responses")) && (!values.model || r.alias === values.model));
-    if (!route) throw new Error("No compatible route");
+    const runProtocol = args[1] === "claude" ? "messages" as const : args[1] === "codex" ? "responses" as const : null;
+    const pick = pickRoute(routes, runProtocol, values.model);
+    if (!pick) throw new Error("No compatible route");
+    const route = pick.route;
+    if (pick.fallback && runProtocol) await noteConvertedRoute(route, runProtocol);
     const duration = values.timeout.match(/^(\d+)(s|m|h)?$/);
     if (!duration) throw new Error("Invalid timeout");
     const timeoutSeconds = Number(duration[1]) * (duration[2] === "h" ? 3600 : duration[2] === "m" ? 60 : 1);

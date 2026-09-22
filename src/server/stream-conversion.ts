@@ -1,5 +1,6 @@
-import type { WireProtocol } from "../shared/types";
+import type { ConversionSink, WireProtocol } from "../shared/types";
 import type { ServerEvent } from "./event-stream";
+import { isHostedItemType, isReasoningType } from "./protocols";
 import { ApiError } from "./security";
 import { emptyUsage, mergeUsage, type Usage } from "./usage";
 
@@ -18,7 +19,18 @@ export class StreamConversion {
   private total=0;
   private nextTool=0;
   private sourceParts=new Map<number,{key:string;type:"text"|"call"}>();
-  constructor(readonly from:WireProtocol,readonly to:WireProtocol,readonly model:string,private write:(chunk:Uint8Array)=>void){}
+  /** messages 源：被跳过的推理块 index，其 delta / stop 一律静默忽略。 */
+  private ignored=new Set<number>();
+  /** responses 源：被跳过的推理或托管调用项 output_index；同时承担 responseItem 重复调用（done 与 completed.output[]）的去重。 */
+  private ignoredItems=new Set<number>();
+  /** chat / gemini 源的增量无法界定边界，每个类型至多记一次。 */
+  private noted=new Set<string>();
+  constructor(readonly from:WireProtocol,readonly to:WireProtocol,readonly model:string,private write:(chunk:Uint8Array)=>void,private readonly sink?:ConversionSink){}
+  private note(type:string,dedupe=false){
+    const sink=this.sink;if(!sink)return;
+    if(dedupe&&this.noted.has(type))return;this.noted.add(type);
+    const found=sink.dropped.find(item=>item.type===type);if(found)found.count++;else sink.dropped.push({type,count:1});
+  }
   private emit(type:string,value:unknown){
     const payload=this.to==="responses"?{...(value as object),sequence_number:this.sequence++}:value;
     this.write(new TextEncoder().encode(`event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`));
@@ -94,7 +106,8 @@ export class StreamConversion {
       for(const choice of e.choices||[]){
         if(choice.index!==undefined&&choice.index!==0)throw new ApiError(422,"conversion_unsupported:multiple_candidates");
         const delta=choice.delta||{};
-        if(delta.reasoning_content||delta.audio)throw new ApiError(422,"conversion_unsupported:reasoning_or_audio");
+        if(delta.audio)throw new ApiError(422,"conversion_unsupported:reasoning_or_audio");
+        if(delta.reasoning_content||delta.reasoning){if(!this.sink?.reasoning)throw new ApiError(422,"conversion_unsupported:reasoning_or_audio");this.note("reasoning_content",true);}
         if(delta.content!==null&&delta.content!==undefined&&typeof delta.content!=="string")throw new ApiError(422,"conversion_unsupported:stream_content");
         if(delta.content)this.delta(this.block("text","text"),delta.content);
         if(delta.refusal)this.delta(this.block("refusal","text"),delta.refusal);
@@ -106,14 +119,21 @@ export class StreamConversion {
       if(e.type==="message_start")this.begin();
       if(e.type==="content_block_start"){
         const p=e.content_block;
-        if(p.type!=="text"&&p.type!=="tool_use")throw new ApiError(422,`conversion_unsupported:${p.type}`);
+        if(p.type!=="text"&&p.type!=="tool_use"){
+          if(!(this.sink?.reasoning&&isReasoningType(p.type)))throw new ApiError(422,`conversion_unsupported:${p.type}`);
+          this.ignored.add(e.index);this.note(p.type);return;
+        }
         const type=p.type==="text"?"text":"call",key=`block:${e.index}`;this.sourceParts.set(e.index,{key,type});
         const block=this.block(key,type,p.id,p.name);this.start(block);
         if(p.type==="text"&&p.text)this.delta(block,p.text);
         if(p.type==="tool_use"&&p.input&&Object.keys(p.input).length)this.delta(block,JSON.stringify(p.input));
       }else if(e.type==="content_block_delta"){
-        const part=this.sourceParts.get(e.index);if(!part)throw new ApiError(502,"stream_block_missing");
-        if(!["text_delta","input_json_delta"].includes(e.delta?.type))throw new ApiError(422,`conversion_unsupported:${e.delta?.type}`);
+        const part=this.sourceParts.get(e.index);
+        if(!part){if(this.ignored.has(e.index))return;throw new ApiError(502,"stream_block_missing");}
+        if(!["text_delta","input_json_delta"].includes(e.delta?.type)){
+          if(!(this.sink?.reasoning&&isReasoningType(e.delta?.type)))throw new ApiError(422,`conversion_unsupported:${e.delta?.type}`);
+          this.note(e.delta.type);return;
+        }
         this.delta(this.block(part.key,part.type),e.delta.text??e.delta.partial_json??"");
       }else if(e.type==="content_block_stop"){const part=this.sourceParts.get(e.index);if(part)this.close(this.block(part.key,part.type));}
       else if(e.type==="message_delta"){this.limited=e.delta?.stop_reason==="max_tokens";if(["pause_turn","refusal"].includes(e.delta?.stop_reason))throw new ApiError(422,`conversion_unsupported:${e.delta.stop_reason}`);}
@@ -123,12 +143,20 @@ export class StreamConversion {
       if(e.type==="response.created")this.begin();
       if(e.type==="response.output_item.added"){
         const item=e.item;if(item.type==="function_call")this.start(this.block(`call:${e.output_index}`,"call",item.call_id,item.name));
-        else if(item.type!=="message")throw new ApiError(422,`conversion_unsupported:${item.type}`);
+        else if(item.type!=="message"){
+          const droppable=(this.sink?.reasoning&&isReasoningType(item.type))||(this.sink?.hosted&&isHostedItemType(item.type));
+          if(!droppable)throw new ApiError(422,`conversion_unsupported:${item.type}`);
+          this.ignoredItems.add(e.output_index);this.note(item.type);
+        }
       }else if(e.type==="response.content_part.added"){
-        if(e.part?.type!=="output_text")throw new ApiError(422,`conversion_unsupported:${e.part?.type}`);
+        if(e.part?.type!=="output_text"){
+          if(this.ignoredItems.has(e.output_index))return;
+          if(!(this.sink?.reasoning&&isReasoningType(e.part?.type)))throw new ApiError(422,`conversion_unsupported:${e.part?.type}`);
+          this.note(e.part.type);return;
+        }
         this.start(this.block(`text:${e.output_index}:${e.content_index}`,"text",e.item_id?`${e.item_id}_${e.content_index}`:undefined));
-      }else if(e.type==="response.output_text.delta")this.delta(this.block(`text:${e.output_index}:${e.content_index}`,"text"),e.delta||"");
-      else if(e.type==="response.function_call_arguments.delta")this.delta(this.block(`call:${e.output_index}`,"call"),e.delta||"");
+      }else if(e.type==="response.output_text.delta"){if(this.ignoredItems.has(e.output_index))return;this.delta(this.block(`text:${e.output_index}:${e.content_index}`,"text"),e.delta||"");}
+      else if(e.type==="response.function_call_arguments.delta"){if(this.ignoredItems.has(e.output_index))return;this.delta(this.block(`call:${e.output_index}`,"call"),e.delta||"");}
       else if(e.type==="response.output_item.done")this.responseItem(e.item,e.output_index);
       else if(["response.completed","response.incomplete"].includes(e.type)){
         for(const [index,item]of (e.response?.output||[]).entries())this.responseItem(item,index);
@@ -139,7 +167,11 @@ export class StreamConversion {
       for(const candidate of e.candidates||[]){
         if(candidate.index!==undefined&&candidate.index!==0)throw new ApiError(422,"conversion_unsupported:multiple_candidates");
         for(const part of candidate.content?.parts||[]){
-          if(part.thoughtSignature||part.thought)throw new ApiError(422,"conversion_unsupported:thought_signature");
+          if(part.thoughtSignature||part.thought){
+            if(part.thought===true&&this.sink?.reasoning){this.note("thought",true);continue;}
+            if(!this.sink?.reasoning)throw new ApiError(422,"conversion_unsupported:thought_signature");
+            this.note("thoughtSignature",true);
+          }
           if(typeof part.text==="string")this.delta(this.block("text","text"),part.text);
           else if(part.functionCall){const call=part.functionCall;const key=call.id?`call:${call.id}`:`call:${this.nextTool}`;const block=this.block(key,"call",call.id,call.name);this.reconcile(block,JSON.stringify(call.args||{}));this.close(block);}
           else throw new ApiError(422,"conversion_unsupported:media");
@@ -150,8 +182,13 @@ export class StreamConversion {
   }
   private responseItem(item:any,index:number){
     if(item.type==="function_call"){const block=this.block(`call:${index}`,"call",item.call_id,item.name);this.reconcile(block,item.arguments||"{}");this.close(block);}
-    else if(item.type==="message")for(const [contentIndex,part]of (item.content||[]).entries()){if(part.type!=="output_text")throw new ApiError(422,`conversion_unsupported:${part.type}`);const block=this.block(`text:${index}:${contentIndex}`,"text");this.reconcile(block,part.text||"");this.close(block);}
-    else throw new ApiError(422,`conversion_unsupported:${item.type}`);
+    else if(item.type==="message")for(const [contentIndex,part]of (item.content||[]).entries()){if(part.type!=="output_text"){if(this.sink?.reasoning&&isReasoningType(part.type)){this.note(part.type,true);continue;}throw new ApiError(422,`conversion_unsupported:${part.type}`);}const block=this.block(`text:${index}:${contentIndex}`,"text");this.reconcile(block,part.text||"");this.close(block);}
+    else {
+      if(this.ignoredItems.has(index))return;
+      const droppable=(this.sink?.reasoning&&isReasoningType(item.type))||(this.sink?.hosted&&isHostedItemType(item.type));
+      if(!droppable)throw new ApiError(422,`conversion_unsupported:${item.type}`);
+      this.ignoredItems.add(index);this.note(item.type);
+    }
   }
   finish(){
     if(this.ended)return;
