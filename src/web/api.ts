@@ -33,13 +33,14 @@ export async function submit(path:string,body:unknown) {
   const value=await response.json();if(!response.ok)throw new RequestError(value.error?.code||"request_failed",response.status);
   window.dispatchEvent(new Event("pgw:jobs"));return value.job as import("../shared/types").PublicJob;
 }
-export function useResource<T>(path: string, interval = 0) {
+export function useResource<T>(path: string, interval = 0, enabled = true) {
   const [data, setData] = useState<T>();
   const [error, setError] = useState<string>();
   const [loading, setLoading] = useState(true);
   const [revision, setRevision] = useState(0);
   const refresh = useCallback(() => setRevision(value => value + 1), []);
   useEffect(() => {
+    if (!enabled) { setLoading(false); return; }
     const controller = new AbortController();
     let pending = false;
     const load = async () => {
@@ -52,7 +53,7 @@ export function useResource<T>(path: string, interval = 0) {
     void load();
     const timer = interval ? setInterval(() => { if (document.visibilityState === "visible") void load(); }, interval) : undefined;
     return () => { controller.abort(); clearInterval(timer); };
-  }, [path, interval, revision]);
+  }, [path, interval, revision, enabled]);
   return { data, error, loading, refresh };
 }
 export const errors: Record<string, I18nKey> = {
