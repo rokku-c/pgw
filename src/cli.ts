@@ -136,11 +136,12 @@ async function wrap(agent: "claude" | "codex" | "pi", raw: string[]) {
   const modelAliases = transparent && agent !== "pi" ? [{ name: MODEL_ALIAS_ANY, routeId: route.id }]
     : requestedAlias ? [{ name: requestedAlias, routeId: route.id }] : [];
   const workspace = await realpath(process.cwd());
-  const access = accessId ? (await request<PublicClient[]>("/clients")).find(c => c.id === accessId && c.enabled && (c.expiresAt === null || c.expiresAt > Date.now())) : undefined;
+  const access = accessId ? (await request<PublicClient[]>("/clients")).find(c => c.id === accessId && c.enabled) : undefined;
   if (accessId && !access) throw new Error("MCP access not found");
   if (access?.project && await realpath(access.project) !== workspace) throw new Error("MCP access belongs to another project");
   if (agent === "pi" && access) throw new Error("Pi MCP launch requires an explicit extension; use codex or claude for this access");
-  const client = await request<PublicClient & { key: string }>("/clients", "POST", { kind: "temporary", expiresAt: Date.now() + 8 * 60 * 60 * 1000, mcpGrants: access?.mcpGrants || [], memoryAccess: access?.memoryAccess || false, name: `${agent}:${process.pid}`, project: workspace, personalize: true, routeIds: [route.id], ...(modelAliases.length ? { modelAliases } : {}) });
+  // Wrapper clients live exactly as long as the child process; the finally block revokes them.
+  const client = await request<PublicClient & { key: string }>("/clients", "POST", { kind: "long_term", expiresAt: null, mcpGrants: access?.mcpGrants || [], memoryAccess: access?.memoryAccess || false, name: `${agent}:${process.pid}`, project: workspace, personalize: true, routeIds: [route.id], ...(modelAliases.length ? { modelAliases } : {}) });
   const env: Record<string, string | undefined> = { ...process.env };
   for (const key of ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL"]) delete env[key];
   const nativeArgs = raw[0] === "--" ? raw.slice(1) : raw;
