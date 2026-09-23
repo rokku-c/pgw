@@ -2,7 +2,7 @@ import { db } from "./store";
 import { atomic } from "./transactions";
 import type { AdaptiveContextPolicy, ModelRoute, Provider, RetryPolicy, Traffic, WireProtocol } from "../shared/types";
 
-export const adaptiveDefaults: AdaptiveContextPolicy = { enabled: false, learn: true, compressionEnabled: true, compressionRatio: .8, maxTokens: null, awarenessPrompt: "部分较早上下文已由网关压缩。保留当前目标、约束和最近工具结果；不要假设被省略的细节仍然可见。" };
+export const adaptiveDefaults: AdaptiveContextPolicy = { enabled: false, learn: true, compressionEnabled: false, compressionRatio: .8, maxTokens: null, awarenessPrompt: "部分较早上下文已由网关压缩。保留当前目标、约束和最近工具结果；不要假设被省略的细节仍然可见。" };
 export const retryDefaults: RetryPolicy = { enabled: false, maxRetries: 3, backoffMs: 250, statuses: [408, 409, 425, 429, 500, 502, 503, 504] };
 export async function adaptivePolicy() { return (await import("./store")).setting<AdaptiveContextPolicy>("adaptiveContext", adaptiveDefaults); }
 export async function retryPolicy() { return (await import("./store")).setting<RetryPolicy>("transparentRetry", retryDefaults); }

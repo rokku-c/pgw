@@ -49,11 +49,12 @@ API 和浏览器验证使用独立临时数据目录、本地模拟上游及临�
 - 只有确认收到工具活动/工具结果后才做续跑判断；用户停止、审批等待、失败、中断、无工具活动和完成条件满足会停止。
 - `continue` 通过同一托管 Agent Session 发起下一轮，`suggest` 转为等待用户确认；Coordinator 决策写入 Run Event。
 - 已有 Codex/Pi/Claude 适配器控制接口仍按各自能力执行；未托管外部 Agent 尚未提供通用跨进程控制，也不会按 PID 强杀。
+- MCP 已增加只读 `gateway_session_context`、`gateway_project_context`、`gateway_trajectory`、`gateway_handoff`，遵循客户端记忆权限和项目范围；这些工具不会自动 steer、resume 或修改 Session。
 
 尚未实现的产品设计项：
 
 - 外部 Agent 的认证跨进程控制、优雅停止/恢复、Handoff 包和未知副作用处理。
-- 透明下一请求 Coordinator Context 注入、只读虚拟查询工具、历史查询句柄和内部查询/归纳的独立预算。
+- 透明下一请求 Coordinator Context 自动注入、虚拟工具与 Trajectory 的更深联动、内部查询/归纳的独立预算和递归隔离。
 - Project/Global Coordinator、干预 Proposal/Intervention 实体、注入 Diff、撤销期限和完整审计展示。
 
 当前实现是“托管续跑协调器”，不是完整的双通道中继。产品设计已在 `docs/product-plan.md` 第 7.4.4 节固定上述边界，后续应先做透明只读查询，再做跨进程恢复，最后才考虑透明内部模型多轮。

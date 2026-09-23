@@ -8,6 +8,7 @@ import { decrypt, encrypt, hash, ApiError, requireAdmin, isAdmin, bearer } from 
 import { atomic } from "./transactions";
 import { version, home, address, adminToken } from "./config";
 import { cliQueryCommands, cliQueryPath, scopeCliQueryPath } from "../shared/cli-queries";
+import { trajectoryNodes, trajectorySession, trajectorySessions } from "./trajectory-sessions";
 import type { McpConnection, McpGrant, McpCall, ClientKey, PublicMcpCall } from "../shared/types";
 
 type Principal = { id: string | null; name: string; project: string | null; sessionKey?: string | null; nativeSessionId?: string | null; nativeTurnId?: string | null; runId?: string | null; parentCallId?: string | null; evidence?: string | null };
@@ -237,6 +238,52 @@ async function runCliQuery(command: string, args: string[], client: ClientKey | 
   return localCliQuery(path, signal);
 }
 
+const trajectoryKey = z.string().regex(/^(scanned|managed|external|route|call):[a-zA-Z0-9-]{1,100}$/);
+
+function requireMemoryAccess(client: ClientKey | null) {
+  if (client && !client.memoryAccess) throw new ApiError(403, "mcp_scope_denied");
+}
+
+function requireProject(client: ClientKey | null, project: string | null | undefined) {
+  if (client?.project && project !== client.project) throw new ApiError(403, "project_scope_denied");
+}
+
+async function scopedTrajectorySessions(input: Parameters<typeof trajectorySessions>[0], client: ClientKey | null) {
+  const limit = Math.min(input.limit || 20, 50);
+  let cursor = input.cursor;
+  let next: string | null = null;
+  const items = [];
+  for (let page = 0; page < 20 && items.length < limit; page++) {
+    const result = await trajectorySessions({ ...input, cursor, limit: Math.min(100, Math.max(limit * 2, 40)) });
+    const visible = client?.project ? result.items.filter(item => item.project === client.project) : result.items;
+    items.push(...visible.slice(0, limit - items.length));
+    next = result.next;
+    if (!result.next) break;
+    cursor = result.next;
+  }
+  return { items, next };
+}
+
+async function visibleTrajectorySession(key: string, client: ClientKey | null) {
+  const session = trajectorySession(key);
+  requireProject(client, session.project);
+  return session;
+}
+
+function trajectoryEnvelope(session: Awaited<ReturnType<typeof trajectorySession>>, page: Awaited<ReturnType<typeof trajectoryNodes>>) {
+  return {
+    sourceId: `trajectory:${session.key}`,
+    observedAt: session.at,
+    generatedAt: Date.now(),
+    coverage: {
+      status: page.next === null ? "complete" : "partial",
+      evidence: session.evidence,
+      total: page.total,
+      revision: page.revision,
+    },
+  };
+}
+
 async function authenticatedClient(request: Request) {
   if (isAdmin(request)) { requireAdmin(request); return null; }
   const key = bearer(request);
@@ -253,7 +300,7 @@ export async function handleMcp(request: Request) {
   const sessionKey=rawSession?`external:${hash(`${client?.id||"admin"}:${rawSession}:${client?.project||""}`)}`:null;
   const principal: Principal = client ? { id: client.id, name: client.name, project: client.project, sessionKey, nativeSessionId, nativeTurnId, runId: client.runId, parentCallId: request.headers.get("x-pgw-attempt-id"), evidence: request.headers.get("x-pgw-attempt-id") ? "model_call_header" : nativeSessionId ? "native_session_header" : null } : { id: null, name: "Admin MCP", project: null, sessionKey, nativeSessionId, nativeTurnId, parentCallId: request.headers.get("x-pgw-attempt-id"), evidence: "admin_request" };
   const server = new McpServer({ name: "personal-gateway", version }, { capabilities: { tools: {}, resources: {}, prompts: {} } });
-  const exposed = { tools: 1 + (!client || client.memoryAccess ? 3 : 0), resources: client && !client.memoryAccess ? 1 : gatewayResources.length, prompts: 0 };
+  const exposed = { tools: 1 + (!client || client.memoryAccess ? 7 : 0), resources: client && !client.memoryAccess ? 1 : gatewayResources.length, prompts: 0 };
   const reauthorize = async () => { const next = await authenticatedClient(request); if (client && next?.id !== client.id) throw new ApiError(403, "mcp_scope_denied"); return next; };
   server.registerTool("gateway_cli", {
     title: "Gateway CLI query",
@@ -274,6 +321,81 @@ export async function handleMcp(request: Request) {
     });
   }
   if (!client || client.memoryAccess) {
+    server.registerTool("gateway_session_context", {
+      title: "Gateway session context",
+      description: "Read-only session index and recent trajectory context within the authorized project.",
+      inputSchema: z.object({
+        sessionKey: trajectoryKey.optional(),
+        query: z.string().max(300).default(""),
+        kind: z.enum(["scanned", "managed", "independent"]).optional(),
+        cursor: z.string().max(3000).optional(),
+        limit: z.number().int().min(1).max(50).default(20),
+      }),
+      annotations: { readOnlyHint: true },
+    }, async ({ sessionKey, query, kind, cursor, limit }) => {
+      const fresh = await reauthorize(); requireMemoryAccess(fresh);
+      if (sessionKey) {
+        const session = await visibleTrajectorySession(sessionKey, fresh);
+        const page = await trajectoryNodes({ key: session.key, offset: 0, limit });
+        return { content: [{ type: "text", text: JSON.stringify({ ...trajectoryEnvelope(session, page), session, recent: page.items }) }] };
+      }
+      const result = await scopedTrajectorySessions({ query, kind, cursor, limit }, fresh);
+      return { content: [{ type: "text", text: JSON.stringify({ sourceId: "trajectory:index", generatedAt: Date.now(), coverage: { status: result.next ? "partial" : "complete", project: fresh?.project || null }, ...result }) }] };
+    });
+
+    server.registerTool("gateway_project_context", {
+      title: "Gateway project context",
+      description: "Read-only recent sessions and work activity for the authorized project.",
+      inputSchema: z.object({ query: z.string().max(300).default(""), cursor: z.string().max(3000).optional(), limit: z.number().int().min(1).max(50).default(20) }),
+      annotations: { readOnlyHint: true },
+    }, async ({ query, cursor, limit }) => {
+      const fresh = await reauthorize(); requireMemoryAccess(fresh);
+      const result = await scopedTrajectorySessions({ query, cursor, limit }, fresh);
+      return { content: [{ type: "text", text: JSON.stringify({ sourceId: "trajectory:project", generatedAt: Date.now(), coverage: { status: result.next ? "partial" : "complete", project: fresh?.project || null }, ...result }) }] };
+    });
+
+    server.registerTool("gateway_trajectory", {
+      title: "Gateway trajectory",
+      description: "Read-only paged trajectory nodes for an authorized session.",
+      inputSchema: z.object({
+        sessionKey: trajectoryKey,
+        offset: z.number().int().min(0).max(10_000_000).default(0),
+        limit: z.number().int().min(1).max(50).default(20),
+        revision: z.string().max(500).optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    }, async ({ sessionKey, offset, limit, revision }) => {
+      const fresh = await reauthorize(); requireMemoryAccess(fresh);
+      const session = await visibleTrajectorySession(sessionKey, fresh);
+      const page = await trajectoryNodes({ key: session.key, offset, limit, revision });
+      return { content: [{ type: "text", text: JSON.stringify({ ...trajectoryEnvelope(session, page), ...page }) }] };
+    });
+
+    server.registerTool("gateway_handoff", {
+      title: "Gateway handoff context",
+      description: "Build a read-only, recent-context handoff packet. It does not steer, resume, stop, or mutate a session.",
+      inputSchema: z.object({
+        sessionKey: trajectoryKey,
+        limit: z.number().int().min(1).max(50).default(20),
+      }),
+      annotations: { readOnlyHint: true },
+    }, async ({ sessionKey, limit }) => {
+      const fresh = await reauthorize(); requireMemoryAccess(fresh);
+      const session = await visibleTrajectorySession(sessionKey, fresh);
+      const head = await trajectoryNodes({ key: session.key, offset: 0, limit: 1 });
+      const offset = Math.max(0, head.total - limit);
+      const page = offset ? await trajectoryNodes({ key: session.key, offset, limit, revision: head.revision }) : head;
+      return { content: [{ type: "text", text: JSON.stringify({
+        sourceId: `handoff:${session.key}`,
+        generatedAt: Date.now(),
+        observedAt: session.at,
+        readOnly: true,
+        coverage: { status: offset === 0 && page.next === null ? "complete" : "partial", evidence: session.evidence, total: page.total, included: page.items.length, revision: page.revision },
+        session,
+        recent: page.items,
+      }) }] };
+    });
+
     server.registerTool("gateway_inventory", { title: "Gateway inventory", inputSchema: z.object({ kind: z.enum(["agent", "skill", "mcp"]).optional() }), annotations: { readOnlyHint: true } }, async ({ kind }) => {
       const fresh = await reauthorize(); if (fresh && !fresh.memoryAccess) throw new ApiError(403, "mcp_scope_denied");
       const items = await db.getRepository(AssetSchema).find({ where: kind ? { kind } : {}, take: 300 });
