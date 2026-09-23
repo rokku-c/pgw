@@ -74,11 +74,11 @@ function RawWindow({ id, stage }: { id: string; stage: CaptureStage }) {
   const resource = usePages<import("../shared/types").CapturePage>(`/traffic/${id}/capture/${stage}?limit=2`, -1, "after");
   return <><div className="trajectory-text-pages">{resource.pages.map((page, index) => <pre key={index}>{page.text}</pre>)}</div>{resource.error && <div role="alert" className="form-error">{resource.error}<Button onClick={() => void resource.load()}>{tr("common.retry")}</Button></div>}<AutoPage more={resource.more} loading={resource.loading} load={resource.load}/></>;
 }
-export function TrajectoryDiff({ before, after }: { before: string; after: string }) {
-  return <DiffWindow key={`${before}:${after}`} before={before} after={after}/>;
+export function TrajectoryDiff({ before, after, beforeStage = "effective", afterStage = "effective" }: { before: string; after: string; beforeStage?: CaptureStage; afterStage?: CaptureStage }) {
+  return <DiffWindow key={`${before}:${after}:${beforeStage}:${afterStage}`} before={before} after={after} beforeStage={beforeStage} afterStage={afterStage}/>;
 }
-function DiffWindow({ before, after }: { before: string; after: string }) {
-  const resource = usePages<{ comparable: boolean; changes: (import("../shared/trajectory").TrajectoryChange & { truncated: boolean })[]; next: number | null; total: number | null }>(`/trajectory/calls/${after}/diff?against=${before}&stage=effective&limit=25`, 0, "offset");
+function DiffWindow({ before, after, beforeStage, afterStage }: { before: string; after: string; beforeStage: CaptureStage; afterStage: CaptureStage }) {
+  const resource = usePages<{ comparable: boolean; changes: (import("../shared/trajectory").TrajectoryChange & { truncated: boolean })[]; next: number | null; total: number | null }>(`/trajectory/calls/${after}/diff?against=${before}&beforeStage=${beforeStage}&afterStage=${afterStage}&limit=25`, 0, "offset");
   const first = resource.pages[0];
   return <div className="trajectory-diff">{first && (!first.comparable ? <p>{tr("trajectory.coverage.incomplete")}</p> : first.total === 0 ? <p>{tr("trajectory.diff.unchanged")}</p> : <div className="mono muted">{first.total}</div>)}{resource.pages.flatMap(page => page.changes).map(change => <section key={change.path} className={`trajectory-change ${change.action}`}><header><Badge>{tr(change.action === "add" ? "trajectory.diff.add" : change.action === "remove" ? "trajectory.diff.remove" : "trajectory.diff.change")}</Badge><code>{change.path}</code></header><div className="trajectory-diff-columns"><pre>{change.before as string ?? "—"}</pre><pre>{change.after as string ?? "—"}</pre></div>{change.truncated && <small>{tr("trajectory.diff.preview")}</small>}</section>)}{resource.error && <div role="alert" className="form-error">{resource.error}<Button onClick={() => void resource.load()}>{tr("common.retry")}</Button></div>}<AutoPage more={resource.more} loading={resource.loading} load={resource.load}/></div>;
 }

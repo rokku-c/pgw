@@ -361,6 +361,69 @@ Session 保留原生身份和来源。归一化事件保留原始事件引用、
 
 控制器产生的消息统一标记为 `coordinator` 事件，记录作用域、触发原因、证据、授权、目标 Session、注入位置、是否被 Agent 采纳和结果。优先级固定为：安全与权限约束 > 用户当前明确要求 > 原生审批/工具状态 > 项目完成条件 > Coordinator 建议 > 历史偏好。Coordinator 不得通过提示词提高权限、绕过审批或覆盖用户停止。
 
+#### 7.4.4 双通道干预架构与上下文接力
+
+本产品明确提供两种干预方式，但不把它们混成“网关可以随时控制任何 Agent”。两种方式共享 Coordinator 决策、证据和审计模型，控制权、注入位置和失败边界不同。
+
+| 通道 | 目标 | 可做的事 | 不能做的事 | 默认状态 |
+| --- | --- | --- | --- | --- |
+| **Agent Adapter Control** | 网关托管的 Agent，或已明确获得控制权的外部 Agent | `steer`、`follow_up`、`interrupt`、`resume`、审批桥接、受控续跑 | 猜 PID、写未知 stdin、绕过权限、把恢复伪装成普通新回合 | 托管 Run 可选开启 |
+| **Gateway Intervention** | Agent 进程不归网关管理，但模型请求经过网关 | 下一请求注入 Coordinator Context、提供只读虚拟查询工具、提供接力摘要和查询句柄 | 唤醒已退出进程、偷偷重发普通请求、替用户执行工具、改变权限 | 默认建议，显式授权后增强 |
+
+##### Agent Adapter Control 的能力阶梯
+
+1. **原生协议优先**：使用 Codex App Server、Pi RPC、Claude 支持的恢复/目标机制；每个适配器声明 `steer`、`follow_up`、`interrupt`、`resume`、审批和会话恢复能力，不以“能转发模型请求”推断控制能力。
+2. **受管进程通道**：仅控制网关创建且仍匹配身份的进程。身份至少包括进程启动时间、父子关系、工作目录、配置目录、原生 Session/Thread ID、一次性 nonce 和控制协议版本。跨进程通信只能走已认证的 stdin/RPC/Unix socket/App Server 通道。
+3. **优雅停止再恢复**：原生 steering 不可用但原生 Session 可恢复时，先发送优雅停止，等待工具/文件副作用收敛，生成 Handoff，再从原生 resume 入口启动。恢复前必须检查最后一个 ToolCall 是否已有 Result；结果未知时进入 `uncertain`，禁止自动重放。
+4. **无法控制的外部进程**：不按进程名、端口或模糊 PID 强杀。创建 `pending_intervention`，等待下一次请求、用户手动接管或用户明确授权的 wrapper 接入。
+
+`kill` 不是 steer。只有网关拥有进程且优雅停止超时，才允许按 `SIGTERM → 等待 → SIGKILL` 的升级路径；每一步都记录原因、进程身份、最后已知副作用和恢复结果。强杀后不自动重放工具调用，不把未知状态标成完成。
+
+##### Gateway Intervention 的透明接力
+
+Agent 不需要安装 PGW CLI、MCP 或 Skill，也可以使用经过网关的透明能力。网关在模型调用边界维护一个最小的接力上下文：
+
+```text
+HandoffContext
+  ├─ objective / completion criteria
+  ├─ current user intent / constraints / permissions
+  ├─ recent messages and recent tool call → result pairs
+  ├─ pending approvals / blockers / budget / retry state
+  ├─ changed files and artifact hashes
+  ├─ evidence IDs / session and request IDs / coverage gaps
+  └─ lookup handles (not full historical transcript)
+```
+
+- 默认只注入近期、与当前目标相关的摘要和查询句柄；完整历史保留在网关，不能因为“可能有用”而全部塞入上下文。
+- 注入优先使用协议的 system/developer/context 位置；不支持时使用明确标记的补充消息，并在 Trajectory 中记录 `injected`、来源、版本和 Diff。
+- 网关可暴露只读虚拟工具：`gateway_session_context`、`gateway_project_context`、`gateway_trajectory`、`gateway_handoff`。工具返回原始事实 ID、时间范围、摘要/原文覆盖度和缺失原因，Agent 自己决定是否查询更多。
+- 虚拟工具一次调用内部可以执行多次本地查询、分页读取和上下文折叠；若启用模型归纳，内部模型调用必须有独立预算、嵌套深度、超时和 `requestGroupId`，不能递归暴露同一工具。
+- 内部查询或归纳对客户端仍表现为一次虚拟工具调用，但成本、延迟、失败、取消和数据外发范围必须可审计。默认不调用外部模型，只做本地检索和确定性摘要。
+- Gateway Intervention 不能把客户端已经看到的回答改写成另一份回答，也不能在用户看不到的情况下偷偷补发普通模型请求；需要多次模型调用时，必须明确承载在虚拟工具或托管 Run 中。
+
+##### 干预状态机与单一控制归属
+
+```text
+observed
+  ├─ no_action
+  ├─ pending_intervention
+  ├─ context_ready → inject_on_next_request
+  ├─ virtual_tool_available → agent_decides
+  ├─ adapter_control_ready → steer | follow_up | interrupt
+  ├─ handoff_required → graceful_stop → resume
+  └─ uncertain → ask_user / inspect / never_replay
+```
+
+同一原生 Session/Thread 同一时间只能有一个控制方。Coordinator 先产生 `Proposal`，再经过授权和能力检查，最后生成 `Intervention`；建议被 Agent 采纳不等于干预成功，干预成功也不等于工作完成。每条记录至少包含：`scope`、`targetSession`、`channel`、`trigger`、`evidenceIds`、`authorization`、`injectionPoint`、`before/after context hash`、`accepted`、`result`、`cost` 和 `expiresAt`。
+
+控制优先级固定为：安全/权限 > 用户当前要求 > 原生审批与工具状态 > 完成条件 > Coordinator 建议 > 历史偏好。用户停止、审批拒绝、未知副作用、上下文冲突和租约失效会取消待执行干预。`tool_call_pending`、`tool_result_received`、`awaiting_model_continuation`、`completed` 必须分开，收到 ToolResult 不能直接当作完成。
+
+##### 接力包与用户体验
+
+Handoff 不是复制整份 transcript，而是可验证的最小工作包：目标、约束、最近事实、未完成事项、工具闭环、文件基线、决策、阻塞、预算和证据引用。用户在 UI/CLI 看到接力预览、注入 Diff、权限范围、预计成本和可撤销期限；确认后才允许跨 Agent 恢复或模型归纳。
+
+第一阶段只交付：托管 Agent 的原生控制、透明下一请求注入、只读虚拟查询和可审计 Handoff。跨进程恢复、文件成果交接、跨 Agent 自动接管和透明内部模型多轮在能力矩阵验证完成前保持显式实验开关。
+
 ### 7.5 项目进度、Advisor 与 Coordinator
 
 项目进度分为事实层和判断层。事实层由固定算法从 Session、SessionEvent、Traffic、工具调用、文件成果和运行状态产生；判断层由 Coordinator Agent 生成，必须引用事实层 ID，不得伪造精确百分比。

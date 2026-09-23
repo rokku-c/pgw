@@ -28,6 +28,11 @@ export default {
   "settings.transparentRetryHint": "仅在尚未向客户端输出内容时重试可重试的上游错误。",
   "settings.retryCount": "最大重试次数",
 
+  "traffic.field.retries": "重试",
+  "traffic.field.rewrite": "改写",
+  "traffic.rewritten": "已改写",
+  "common.previous": "上一页",
+  "common.next": "下一页",
   "traffic.field.firstToken": "首 Token",
   "traffic.field.decoding": "生成耗时",
 
@@ -112,6 +117,8 @@ export default {
   "observability.metric.calls": "模型调用",
   "observability.kind.model_call": "模型调用",
 
+  "traffic.tab.rewrite": "改写 Diff",
+  "traffic.field.requestHeaders": "请求 Header",
   "traffic.tab.diff": "会话 Diff",
   "traffic.view.structured": "结构化",
   "traffic.view.raw": "原文",

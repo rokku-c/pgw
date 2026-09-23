@@ -29,6 +29,11 @@ const messages = {
   "settings.transparentRetryHint": "Retry eligible upstream errors before output reaches the client.",
   "settings.retryCount": "Max retries",
 
+  "traffic.field.retries": "Retries",
+  "traffic.field.rewrite": "Rewrite",
+  "traffic.rewritten": "Rewritten",
+  "common.previous": "Previous",
+  "common.next": "Next",
   "traffic.field.firstToken": "First token",
   "traffic.field.decoding": "Decoding",
 
@@ -113,6 +118,8 @@ const messages = {
   "observability.metric.calls": "model calls",
   "observability.kind.model_call": "Model call",
 
+  "traffic.tab.rewrite": "Rewrite diff",
+  "traffic.field.requestHeaders": "Request headers",
   "traffic.tab.diff": "Session diff",
   "traffic.view.structured": "Structured",
   "traffic.view.raw": "Raw",

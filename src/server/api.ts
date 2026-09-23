@@ -122,7 +122,11 @@ export async function api(request: Request) {
     await audit(previous ? "route.updated" : "route.created", item.alias); return Response.json(item);
   }
   if (routeMatch && method === "DELETE") { const item = await get(RouteSchema, routeMatch[1]); await db.getRepository(RouteSchema).delete(item.id); await audit("route.deleted", item.alias); return Response.json({ ok: true }); }
-  if (path === "/clients" && method === "GET") return Response.json((await db.getRepository(ClientSchema).find({ order: { createdAt: "DESC" } })).map(publicClient));
+  if (path === "/clients" && method === "GET") {
+    const input=z.object({offset:z.coerce.number().int().min(0).default(0),limit:z.coerce.number().int().min(1).max(100).default(40)}).parse(Object.fromEntries(url.searchParams));
+    const repo=db.getRepository(ClientSchema); const total=await repo.count(); const items=(await repo.find({order:{createdAt:"DESC"},skip:input.offset,take:input.limit})).map(publicClient);
+    return Response.json({items,total,next:input.offset+items.length<total?input.offset+items.length:null});
+  }
   if (path === "/clients" && method === "POST") {
     const input = clientInput.parse(await readJson(request));
     for (const id of input.routeIds) await get(RouteSchema, id);
@@ -218,7 +222,7 @@ export async function api(request: Request) {
   const trajectoryCall=path.match(/^\/trajectory\/calls\/([^/]+)\/(inspect|diff)$/);
   if(trajectoryCall&&method==="GET"){
     const item=await get(TrafficSchema,trajectoryCall[1]);
-    const input=z.object({stage:z.enum(["request","effective","upstream","response","output"]).default("effective"),offset:z.coerce.number().int().min(0).max(1000000).default(0),limit:z.coerce.number().int().min(1).max(50).default(30),section:z.enum(["system","messages","tools","config","transport","output","other"]).optional(),block:z.string().max(400).optional(),start:z.coerce.number().int().min(0).max(64*1024*1024).optional(),against:z.string().uuid().optional()}).parse(Object.fromEntries(url.searchParams));
+    const input=z.object({stage:z.enum(["request","effective","upstream","response","output"]).default("effective"),beforeStage:z.enum(["request","effective","upstream","response","output"]).optional(),afterStage:z.enum(["request","effective","upstream","response","output"]).optional(),offset:z.coerce.number().int().min(0).max(1000000).default(0),limit:z.coerce.number().int().min(1).max(50).default(30),section:z.enum(["system","messages","tools","config","transport","output","other"]).optional(),block:z.string().max(400).optional(),start:z.coerce.number().int().min(0).max(64*1024*1024).optional(),against:z.string().uuid().optional()}).parse(Object.fromEntries(url.searchParams));
     if(trajectoryCall[2]==="inspect")return Response.json(await inspectTrajectory({id:item.id,...input},request.signal));
     if(!input.against)throw new ApiError(400,"snapshot_compare_required");
     await get(TrafficSchema,input.against);
@@ -239,7 +243,14 @@ export async function api(request: Request) {
     const sessionRequests = item.affinityId ? await db.getRepository(TrafficSchema).find({ where: { affinityId: item.affinityId }, order: { createdAt: "ASC" }, take: 100 }) : [];
     return Response.json({ request: item, attempts, capture, sessionRequests });
   }
-  if (path === "/traffic" && method === "GET") return Response.json(await db.getRepository(TrafficSchema).find({ order: { createdAt: "DESC" }, take: 200 }));
+  if (path === "/traffic" && method === "GET") {
+    const input=z.object({offset:z.coerce.number().int().min(0).default(0),limit:z.coerce.number().int().min(1).max(100).default(40),query:z.string().max(200).optional(),status:z.enum(["running","completed","failed","cancelled"]).optional()}).parse(Object.fromEntries(url.searchParams));
+    const repo=db.getRepository(TrafficSchema); const query=repo.createQueryBuilder("t");
+    if(input.status)query.andWhere("t.status=:status",{status:input.status});
+    if(input.query)query.andWhere("(lower(t.model) LIKE :q OR lower(t.clientName) LIKE :q OR lower(t.providerName) LIKE :q)",{q:`%${input.query.toLowerCase()}%`});
+    const total=await query.getCount(); const items=await query.orderBy("t.createdAt","DESC").skip(input.offset).take(input.limit).getMany();
+    return Response.json({items,total,next:input.offset+items.length<total?input.offset+items.length:null});
+  }
   if(path==="/asset-roots"&&method==="GET")return Response.json(await assetRoots());
   const assetRoot=path.match(/^\/asset-roots\/([^/]+)(?:\/(scan))?$/);
   if(path==="/asset-roots"&&method==="POST"||assetRoot&&!assetRoot[2]&&method==="PATCH"){
@@ -317,7 +328,7 @@ export async function api(request: Request) {
   }
   if (path === "/settings" && method === "GET") return Response.json({ personalization: await setting("personalization", true), observability: { ...await capturePolicy(), ...await captureUsage() }, adaptiveContext: await adaptivePolicy(), protocolConversion: await protocolConversionEnabled(), discardReasoning: await discardReasoningEnabled(), ignoreHostedTools: await ignoreHostedToolsEnabled(), transparentRetry: await retryPolicy() });
   if (path === "/settings" && method === "PATCH") {
-    const input = z.object({ personalization: z.boolean().optional(), observability: z.object({ enabled:z.boolean(), retentionDays:z.number().int().min(1).max(365), maxStageBytes:z.number().int().min(65536).max(64*1024*1024), maxStorageBytes:z.number().int().min(1024*1024).max(5*1024*1024*1024) }).optional(), adaptiveContext: z.object({enabled:z.boolean(),learn:z.boolean(),compressionEnabled:z.boolean(),compressionRatio:z.number().min(.5).max(1),maxTokens:z.number().int().min(256).max(4_000_000).nullable(),awarenessPrompt:z.string().max(4000)}).optional(), protocolConversion:z.boolean().optional(), discardReasoning:z.boolean().optional(), ignoreHostedTools:z.boolean().optional(), transparentRetry:z.object({enabled:z.boolean(),maxRetries:z.number().int().min(0).max(100),backoffMs:z.number().int().min(0).max(60000),statuses:z.array(z.number().int().min(400).max(599)).max(30)}).optional() }).refine(value => Object.values(value).some(item => item !== undefined)).parse(await readJson(request));
+    const input = z.object({ personalization: z.boolean().optional(), observability: z.object({ enabled:z.boolean(), retentionDays:z.number().int().min(1).max(365), maxStageBytes:z.number().int().min(65536).max(64*1024*1024), maxStorageBytes:z.number().int().min(1024*1024).max(5*1024*1024*1024) }).optional(), adaptiveContext: z.object({enabled:z.boolean(),learn:z.boolean(),compressionEnabled:z.boolean(),compressionRatio:z.number().min(.5).max(1),maxTokens:z.number().int().min(256).max(4_000_000).nullable(),awarenessPrompt:z.string().max(4000)}).optional(), protocolConversion:z.boolean().optional(), discardReasoning:z.boolean().optional(), ignoreHostedTools:z.boolean().optional(), transparentRetry:z.object({enabled:z.boolean(),maxRetries:z.number().int().min(0).max(100).nullable(),backoffMs:z.number().int().min(0).max(60000),statuses:z.array(z.number().int().min(400).max(599)).max(30)}).optional() }).refine(value => Object.values(value).some(item => item !== undefined)).parse(await readJson(request));
     if(input.personalization !== undefined) await saveSetting("personalization", input.personalization);
     if(input.observability) await configureCapture(input.observability);
     if(input.adaptiveContext) await saveSetting("adaptiveContext", input.adaptiveContext);
@@ -402,7 +413,13 @@ export async function api(request: Request) {
     const input = z.object({ accept: z.boolean().optional(), answers: z.record(z.string(), z.array(z.string().max(10000)).max(10)).optional(), value: z.string().max(10000).optional() }).refine(v => v.accept !== undefined || v.answers !== undefined || v.value !== undefined).parse(await readJson(request));
     return Response.json(await decideApproval(approvalMatch[1], input));
   }
-  if(path==="/jobs"&&method==="GET")return Response.json((await db.query("SELECT id,createdAt,updatedAt,kind,label,status,phase,processed,total,currentItem,attempts,nextRunAt,startedAt,endedAt,heartbeatAt,cancelRequested,error FROM background_jobs ORDER BY createdAt DESC LIMIT 100")));
+  if(path==="/jobs"&&method==="GET"){
+    const input=z.object({offset:z.coerce.number().int().min(0).default(0),limit:z.coerce.number().int().min(1).max(100).default(40),status:z.string().max(30).optional(),kind:z.string().max(80).optional()}).parse(Object.fromEntries(url.searchParams));
+    const where:string[]=[];const values:unknown[]=[];if(input.status){where.push("status=?");values.push(input.status);}if(input.kind){where.push("kind=?");values.push(input.kind);}const clause=where.length?`WHERE ${where.join(" AND ")}`:"";
+    const [{n:total}]=await db.query(`SELECT count(*) n FROM background_jobs ${clause}`,values) as {n:number}[];
+    const items=await db.query(`SELECT id,createdAt,updatedAt,kind,label,status,phase,processed,total,currentItem,attempts,nextRunAt,startedAt,endedAt,heartbeatAt,cancelRequested,error FROM background_jobs ${clause} ORDER BY createdAt DESC LIMIT ? OFFSET ?`,[...values,input.limit,input.offset]);
+    return Response.json({items,total,next:input.offset+items.length<total?input.offset+items.length:null});
+  }
   if(path==="/debug/model"&&method==="POST") {const input=debugInput.parse(await readJson(request,2*1024*1024));return Response.json({job:await submitJob("model.debug","模型调试",input,false)},{status:202});}
   const attemptMatch=path.match(/^\/jobs\/([^/]+)\/attempts(?:\/([^/]+))?$/);
   if(attemptMatch&&method==="GET")return Response.json(attemptMatch[2]?await debugAttemptDetail(attemptMatch[1],attemptMatch[2]):await debugAttempts(attemptMatch[1]));

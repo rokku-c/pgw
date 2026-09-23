@@ -28,6 +28,7 @@ export interface ClientKey extends RecordBase {
 }
 export type PublicClient = Omit<ClientKey, "keyHash">;
 export interface Traffic extends RecordBase {
+  requestHeaders: Record<string, string>;
   clientId: string; clientName: string; routeId: string; model: string;
   providerId: string; providerName: string; protocol: WireProtocol;
   status: "running" | "completed" | "failed" | "cancelled";
@@ -179,7 +180,7 @@ export interface AdaptiveContextPolicy {
   enabled: boolean; learn: boolean; compressionEnabled: boolean; compressionRatio: number;
   maxTokens: number | null; awarenessPrompt: string;
 }
-export interface RetryPolicy { enabled: boolean; maxRetries: number; backoffMs: number; statuses: number[] }
+export interface RetryPolicy { enabled: boolean; maxRetries: number | null; backoffMs: number; statuses: number[] }
 export interface GatewayPolicies { adaptiveContext: AdaptiveContextPolicy; protocolConversion: boolean; transparentRetry: RetryPolicy }
 export interface CapturePolicy { enabled:boolean; revision:number; retentionDays:number; maxStageBytes:number; maxStorageBytes:number }
 export type CaptureStage = "request" | "effective" | "upstream" | "response" | "output";

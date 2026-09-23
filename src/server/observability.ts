@@ -5,6 +5,10 @@ import type { CapturePolicy,CaptureStage,CaptureInfo,CapturePage } from "../shar
 
 export const captureDefaults:CapturePolicy={enabled:true,revision:3,retentionDays:7,maxStageBytes:16*1024*1024,maxStorageBytes:512*1024*1024};
 export function captureHeaders(headers:Headers){return Object.fromEntries(headers.entries());}
+export function clientHeaders(headers:Headers){
+  const hidden=/^(authorization|cookie|set-cookie|x-api-key|api-key)$/i;
+  return Object.fromEntries([...headers.entries()].filter(([key])=>!hidden.test(key)));
+}
 export function captureUrl(value:string){return value;}
 let writer:Worker|undefined,viewer:Worker|undefined,sequence=0,queuedBytes=0;
 const pending=new Map<number,number>();

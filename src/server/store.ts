@@ -13,7 +13,7 @@ const boolean: EntitySchemaColumnOptions = { type: "boolean" };
 const base = { id: { type: "text", primary: true }, createdAt: integer(), updatedAt: integer() } satisfies Record<string, EntitySchemaColumnOptions>;
 /** 当前 schema 版本。**新增迁移时必须同步改这里** —— 下面的守卫与迁移块若与它脱钩，
  *  库升到新版本后的下一次启动会被守卫误判为"过新的库"而拒绝启动。 */
-export const SCHEMA_VERSION = 25;
+export const SCHEMA_VERSION = 26;
 function schema<T extends ObjectLiteral>(name: string, columns: Record<string, EntitySchemaColumnOptions>) {
   return new EntitySchema<T>({ name, tableName: name, columns: { ...base, ...columns } as never });
 }
@@ -34,7 +34,7 @@ export const ClientSchema = schema<ClientKey>("clients", {
 export const TrafficSchema = schema<Traffic>("traffic", {
   clientId: text(), clientName: text(), routeId: text(), model: text(), providerId: text(), providerName: text(),
   protocol: text(), status: text(), upstreamStatus: integer(true), latencyMs: integer(true), firstByteMs: integer(true), firstTokenMs: integer(true), decodingMs: integer(true),
-  inputTokens: integer(true), outputTokens: integer(true), costMicros: integer(true), error: text(true),
+  inputTokens: integer(true), outputTokens: integer(true), costMicros: integer(true), error: text(true), requestHeaders: { ...json, default: "{}" },
   stream: boolean, project: text(true), patchIds: json, requestGroupId: text(true), affinityId: text(true), responseId: text(true), cacheReadTokens: { ...integer(), default: 0 }, cacheWriteTokens: { ...integer(), default: 0 }, cacheWriteLongTokens: { ...integer(), default: 0 }, reasoningTokens: { ...integer(), default: 0 }, decisions: { ...json, default: '[]' }, bytesTotal: { ...integer(), default: 0 }, progressAt: integer(true), runId: text(true), accounting: { ...text(), default: "unknown" }, pricing: { ...json, default: '{"input":null,"output":null}' },
 });
 export const PreferenceSchema = schema<Preference>("preferences", {
@@ -312,6 +312,12 @@ export async function initializeStore() {
   if(jobIndexVersion[0].version<25){await db.transaction(async manager=>{
     await manager.query('CREATE INDEX IF NOT EXISTS jobs_kind_history ON background_jobs(kind,status,createdAt)');
     await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(25,?)',[Date.now()]);
+  });}
+  const trafficHeadersVersion=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(trafficHeadersVersion[0].version<26){await db.transaction(async manager=>{
+    const existing=await manager.query('PRAGMA table_info(traffic)') as {name:string}[];
+    if(!existing.some(c=>c.name==="requestHeaders"))await manager.query("ALTER TABLE traffic ADD COLUMN requestHeaders TEXT NOT NULL DEFAULT '{}' ");
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(26,?)',[Date.now()]);
   });}
   await db.query("UPDATE request_captures SET state='partial',reason='gateway_restarted',updatedAt=? WHERE state='recording'",[Date.now()]);
   await db.query("UPDATE asset_deployments SET status='uncertain',error='gateway_restarted',updatedAt=? WHERE status IN ('applying','restoring')",[Date.now()]);

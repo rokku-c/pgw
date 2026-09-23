@@ -57,8 +57,8 @@ export function inspectContent(input: { id: string; stage: CaptureStage | "node"
   };
   return window;
 }
-export async function compareTrajectory(input: { before: string; after: string; stage: CaptureStage; offset?: number; limit?: number }, signal?: AbortSignal) {
-  const before = await capturedStage(input.before, input.stage, signal), after = await capturedStage(input.after, input.stage, signal);
+export async function compareTrajectory(input: { before: string; after: string; stage?: CaptureStage; beforeStage?: CaptureStage; afterStage?: CaptureStage; offset?: number; limit?: number }, signal?: AbortSignal) {
+  const before = await capturedStage(input.before, input.beforeStage || input.stage || "effective", signal), after = await capturedStage(input.after, input.afterStage || input.stage || "effective", signal);
   const complete = [before, after].every(value => value.coverage === "complete" && value.text);
   const coverage = { before: before.coverage, after: after.coverage, reason: before.reason || after.reason };
   if (!complete) return { coverage, comparable: false, changes: [], total: null, next: null };

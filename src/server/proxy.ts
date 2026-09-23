@@ -10,7 +10,7 @@ import { convertRequest, convertResponse, isReasoningDrop } from "./protocols";
 import { StreamConversion } from "./stream-conversion";
 import { EventStreamParser, type ServerEvent } from "./event-stream";
 import { balancedTargets, beginRouteSession, frozenPreferences, pinRoute, recordResponse, releaseRouteSession, unpinRejectedRoute, responseBinding, providerFingerprint, circuitPermit, circuitResult, retryAfter, type FrozenPreference, type RouteSession } from "./routing";
-import { beginCapture, capturePolicy, captureHeaders, captureUrl, type RequestCapture } from "./observability";
+import { beginCapture, capturePolicy, captureHeaders, clientHeaders, captureUrl, type RequestCapture } from "./observability";
 import { applyAdaptiveContext, recordAdaptiveObservation, protocolConversionEnabled, discardReasoningEnabled, ignoreHostedToolsEnabled, retryPolicy } from "./context-management";
 import { upstreamWireOf } from "../shared/endpoints";
 import { MODEL_ALIAS_ANY, resolveRoute } from "../shared/routes";
@@ -122,7 +122,7 @@ export async function proxy(request:Request):Promise<Response> {
     let lastError:ApiError|undefined;
     if(session?.providerId && !route.targets.some(t=>t.providerId===session.providerId && t.model===session.model))throw new ApiError(409,"pinned_target_removed");
     const targets=session?.providerId?route.targets.filter(t=>t.providerId===session.providerId && t.model===session.model):await balancedTargets(route);
-    const attemptLimit=Math.max(1,targets.length+(retryConfig.enabled?retryConfig.maxRetries:0));
+    const attemptLimit=retryConfig.enabled&&retryConfig.maxRetries===null?Number.MAX_SAFE_INTEGER:Math.max(1,targets.length+(retryConfig.enabled?(retryConfig.maxRetries||0):0));
     for(let targetIndex=0;targetIndex<attemptLimit;targetIndex++) {
       const target=targets[targetIndex%targets.length];
       const provider=await db.getRepository(ProviderSchema).findOneBy({id:target.providerId,enabled:true});
@@ -143,9 +143,9 @@ export async function proxy(request:Request):Promise<Response> {
       if(session?.providerFingerprint && session.providerFingerprint!==providerFingerprint(provider))throw new ApiError(409,"pinned_provider_changed");
       const circuit=await circuitPermit(provider,target.model);
       decisions.push({action:circuit.allowed?"select":"skip",target:provider.id,reason:session?.providerId?`session_pinned:${circuit.reason}`:circuit.reason});
-      if(!circuit.allowed){ lastError=new ApiError(503,"circuit_open");continue; }
+      if(!circuit.allowed){ lastError=new ApiError(503,"circuit_open"); if(retryConfig.enabled&&retryConfig.maxRetries===null)await Bun.sleep(Math.max(1000,retryConfig.backoffMs)); continue; }
       const started=Date.now();
-      const traffic:Traffic={...record(),clientId:client.id,clientName:client.name,routeId:route.id,model:route.alias,providerId:provider.id,providerName:provider.name,protocol,status:"running",upstreamStatus:null,latencyMs:null,firstByteMs:null,firstTokenMs:null,decodingMs:null,...emptyUsage(),costMicros:null,error:null,stream:!!body.stream,project:client.project,patchIds:prefs.map(p=>`${p.id}:${p.revision}`),runId:client.runId,accounting:"pending",pricing:{input:route.inputPrice,output:route.outputPrice,cacheRead:route.cacheReadPrice,cacheWrite:route.cacheWritePrice,cacheWriteLong:route.cacheWriteLongPrice},requestGroupId:group,affinityId:session?.id||null,responseId:null,decisions:[...decisions],bytesTotal:0,progressAt:null};
+      const traffic:Traffic={...record(),clientId:client.id,clientName:client.name,routeId:route.id,model:route.alias,providerId:provider.id,providerName:provider.name,protocol,status:"running",upstreamStatus:null,latencyMs:null,firstByteMs:null,firstTokenMs:null,decodingMs:null,...emptyUsage(),requestHeaders:clientHeaders(request.headers),costMicros:null,error:null,stream:!!body.stream,project:client.project,patchIds:prefs.map(p=>`${p.id}:${p.revision}`),runId:client.runId,accounting:"pending",pricing:{input:route.inputPrice,output:route.outputPrice,cacheRead:route.cacheReadPrice,cacheWrite:route.cacheWritePrice,cacheWriteLong:route.cacheWriteLongPrice},requestGroupId:group,affinityId:session?.id||null,responseId:null,decisions:[...decisions],bytesTotal:0,progressAt:null};
       let capture:RequestCapture = { json(){}, chunk(){}, metadata(){}, secret(){}, finish(){} };
       try{ await reserveBudget(traffic.id,client,route,outputTokens,{key:`${route.id}:${target.providerId}:${target.model}`,maxConcurrent:target.maxConcurrent}); await db.getRepository(TrafficSchema).save(traffic);
         await recordCallContext(traffic,context);
@@ -224,10 +224,11 @@ export async function proxy(request:Request):Promise<Response> {
         if(!response.ok){
           rejected=[400,401,403,404,413,422,429].includes(response.status);cooldown=retryAfter(response.headers.get("retry-after"));
           if(response.body){const errorReader=response.body.getReader();const errorChunks:Uint8Array[]=[];let errorSize=0;while(errorSize<1024*1024){const next=await errorReader.read();if(next.done)break;errorSize+=next.value.length;errorChunks.push(next.value);if(errorSize>=1024*1024)break;}capture.chunk("response",Buffer.concat(errorChunks));await errorReader.cancel().catch(()=>{});}
-          await finish("failed",`upstream_${response.status}`);
           lastError=new ApiError(response.status===429?429:502,`upstream_${response.status}`);
           const retryable=retryConfig.enabled&&retryConfig.statuses.includes(response.status)&&targetIndex<attemptLimit-1&&!session?.providerId;
-          if(retryable){decisions.push({action:"retry",target:provider.id,reason:`upstream_${response.status}#${targetIndex+1}`});await Bun.sleep(Math.min(30000,retryConfig.backoffMs*Math.max(1,2**Math.min(targetIndex,8))));continue;}
+          if(retryable)decisions.push({action:"retry",target:provider.id,reason:`upstream_${response.status}#${targetIndex+1}`});
+          await finish("failed",`upstream_${response.status}`);
+          if(retryable){await Bun.sleep(Math.min(30000,retryConfig.backoffMs*Math.max(1,2**Math.min(targetIndex,8))));continue;}
           if(response.status===429&&!session?.providerId){decisions.push({action:"fallback",target:provider.id,reason:"explicit_rate_limit_rejection"});continue;}
           throw lastError;
         }
