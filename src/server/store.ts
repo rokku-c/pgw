@@ -13,7 +13,7 @@ const boolean: EntitySchemaColumnOptions = { type: "boolean" };
 const base = { id: { type: "text", primary: true }, createdAt: integer(), updatedAt: integer() } satisfies Record<string, EntitySchemaColumnOptions>;
 /** 当前 schema 版本。**新增迁移时必须同步改这里** —— 下面的守卫与迁移块若与它脱钩，
  *  库升到新版本后的下一次启动会被守卫误判为"过新的库"而拒绝启动。 */
-const SCHEMA_VERSION = 24;
+export const SCHEMA_VERSION = 25;
 function schema<T extends ObjectLiteral>(name: string, columns: Record<string, EntitySchemaColumnOptions>) {
   return new EntitySchema<T>({ name, tableName: name, columns: { ...base, ...columns } as never });
 }
@@ -308,6 +308,11 @@ export async function initializeStore() {
     if(!existing.some(c=>c.name==="progressAt"))await manager.query('ALTER TABLE traffic ADD COLUMN progressAt INTEGER');
     await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(24,?)',[Date.now()]);
   });}
+  const jobIndexVersion=await db.query('SELECT MAX(version) version FROM schema_versions');
+  if(jobIndexVersion[0].version<25){await db.transaction(async manager=>{
+    await manager.query('CREATE INDEX IF NOT EXISTS jobs_kind_history ON background_jobs(kind,status,createdAt)');
+    await manager.query('INSERT INTO schema_versions(version,appliedAt) VALUES(25,?)',[Date.now()]);
+  });}
   await db.query("UPDATE request_captures SET state='partial',reason='gateway_restarted',updatedAt=? WHERE state='recording'",[Date.now()]);
   await db.query("UPDATE asset_deployments SET status='uncertain',error='gateway_restarted',updatedAt=? WHERE status IN ('applying','restoring')",[Date.now()]);
   await db.query("UPDATE debug_attempts SET status='uncertain',error='gateway_restarted',endedAt=? WHERE status='running'",[Date.now()]);
@@ -325,9 +330,15 @@ export function record(): RecordBase { return { id: crypto.randomUUID(), created
 export async function audit(action: string, subject: string, detail: Record<string, unknown> = {}) {
   await db.getRepository(AuditSchema).save({ ...record(), action, subject, detail });
 }
+const settingCache = new Map<string, { value: unknown; expiresAt: number }>();
 export async function setting<T>(key: string, fallback: T): Promise<T> {
-  return (await db.getRepository(SettingSchema).findOneBy({ id: key }))?.value as T ?? fallback;
+  const cached = settingCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value as T;
+  const value = (await db.getRepository(SettingSchema).findOneBy({ id: key }))?.value as T ?? fallback;
+  settingCache.set(key, { value, expiresAt: Date.now() + 5000 });
+  return value;
 }
 export async function saveSetting(key: string, value: unknown) {
   await db.getRepository(SettingSchema).save({ ...record(), id: key, value });
+  settingCache.delete(key);
 }

@@ -12,6 +12,8 @@ const lanes: Lane[] = [
   { current:null,ticking:false,kinds:["model.debug","mcp.debug","assets.apply","assets.restore"] },
 ];
 let stopping=false,lastSnapshotCleanup=0;
+const scanIntervalMs=5*60_000, jobCleanupIntervalMs=30*60_000;
+let lastJobCleanup=0;
 let tickTimer: ReturnType<typeof setInterval> | undefined, scanTimer: ReturnType<typeof setInterval> | undefined;
 export function publicJob(job: BackgroundJob): PublicJob { const { payloadCipher,resultCipher,dedupKey,...rest }=job; return rest; }
 export async function submitJob(kind:JobKind,label:string,payload:unknown,deduplicate=true) {
@@ -53,6 +55,11 @@ export async function retryJob(id:string,confirmed:boolean) {
   if(["model.debug","mcp.debug","assets.apply","assets.restore"].includes(job.kind)&&!confirmed)throw new ApiError(400,"confirmation_required");
   return submitJob(job.kind,job.label,JSON.parse(decrypt(job.payloadCipher)),false);
 }
+async function pruneScanJobs() {
+  await atomic(database => {
+    for (const kind of ["sessions.scan", "assets.scan"] as const) database.query(`DELETE FROM background_jobs WHERE kind=? AND status IN ('completed','failed','cancelled') AND id NOT IN (SELECT id FROM background_jobs WHERE kind=? AND status IN ('completed','failed','cancelled') ORDER BY createdAt DESC LIMIT 1000)`).run(kind, kind);
+  });
+}
 async function tick() {
   await Promise.all(lanes.map(async lane=>{
     if(lane.ticking||stopping||lane.current)return;
@@ -79,7 +86,8 @@ async function tick() {
 }
 export function startScheduler() {
   stopping=false;lastSnapshotCleanup=Date.now();tickTimer=setInterval(()=>{void tick().catch(error=>console.error("Scheduler",error));},300);tickTimer.unref();
-  scanTimer=setInterval(()=>{void (async()=>{if(Date.now()-lastSnapshotCleanup>1800000){lastSnapshotCleanup=Date.now();await submitJob("trajectory.cleanup","snapshot.cleanup",{});}for(const source of await db.getRepository(SourceSchema).findBy({enabled:true}))await submitJob("sessions.scan",source.name,{sourceId:source.id});for(const root of await db.getRepository(AssetRootSchema).findBy({enabled:true}))if(!root.lastScanAt||Date.now()-root.lastScanAt>300000)await submitJob("assets.scan",root.name,{rootId:root.id});})().catch(error=>console.error("Scheduled collection",error));},30000);scanTimer.unref();
+  scanTimer=setInterval(()=>{void (async()=>{const now=Date.now();if(now-lastSnapshotCleanup>1800000){lastSnapshotCleanup=now;await submitJob("trajectory.cleanup","snapshot.cleanup",{});}if(now-lastJobCleanup>jobCleanupIntervalMs){lastJobCleanup=now;await pruneScanJobs();}for(const source of await db.getRepository(SourceSchema).findBy({enabled:true}))if(!source.lastScanAt||now-source.lastScanAt>=scanIntervalMs)await submitJob("sessions.scan",source.name,{sourceId:source.id});for(const root of await db.getRepository(AssetRootSchema).findBy({enabled:true}))if(!root.lastScanAt||now-root.lastScanAt>300000)await submitJob("assets.scan",root.name,{rootId:root.id});})().catch(error=>console.error("Scheduled collection",error));},30000);scanTimer.unref();
+  lastJobCleanup=Date.now();void pruneScanJobs().catch(error=>console.error("Job cleanup",error));
   void submitJob("trajectory.cleanup","snapshot.cleanup",{}).catch(error=>console.error("Snapshot cleanup",error));
   void tick();
 }

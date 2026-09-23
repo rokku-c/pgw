@@ -212,9 +212,12 @@ try {
     if (!(["start", "storage"].includes(command))) await ensureServer();
     if (["claude", "codex", "pi"].includes(command)) await wrap(command as "claude" | "codex" | "pi", args.slice(1));
   else if (command === "start") {
-    const child = Bun.spawn([process.execPath, join(root, "src/server/index.ts")], { cwd: root, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
-    const stop = () => child.kill("SIGTERM"); process.on("SIGINT", stop); process.on("SIGTERM", stop);
-    process.exitCode = await child.exited;
+    try { await request("/status"); console.log(`Personal Gateway already running at ${address}`); }
+    catch {
+      const child = Bun.spawn([process.execPath, join(root, "src/server/index.ts")], { cwd: root, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+      const stop = () => child.kill("SIGTERM"); process.on("SIGINT", stop); process.on("SIGTERM", stop);
+      process.exitCode = await child.exited;
+    }
   } else if (command === "open") {
     await ensureServer();
     const url = `${address}/#token=${adminToken}`;

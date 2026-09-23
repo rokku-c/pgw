@@ -5,7 +5,7 @@ import { home } from "./config";
 import { acquireOwnership } from "./ownership";
 import { openSessionFile } from "./session-files";
 import type { CollectionSource, Session } from "../shared/types";
-import { audit, db } from "./store";
+import { audit, db, SCHEMA_VERSION } from "./store";
 import { ApiError } from "./security";
 import type { StorageCategory, StorageUsage } from "../shared/types";
 
@@ -28,7 +28,7 @@ export async function compactStorage(progress: (value: Record<string, unknown>) 
     if (space.bavail * space.bsize < before.bytes * 1.2) throw new Error("Insufficient temporary space for safe SQLite compaction");
     database.run("PRAGMA busy_timeout = 1000");
     const version = (database.query("SELECT max(version) version FROM schema_versions").get() as { version: number }).version;
-    if (version < 12 || version > 21) throw new Error("Start the updated gateway once before compacting");
+    if (version < 12 || version > SCHEMA_VERSION) throw new Error("Start the updated gateway once before compacting");
     database.run("PRAGMA wal_checkpoint(TRUNCATE)");
     database.run("PRAGMA journal_mode = DELETE");
     database.run("PRAGMA locking_mode = EXCLUSIVE");

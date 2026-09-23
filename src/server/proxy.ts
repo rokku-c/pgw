@@ -118,7 +118,7 @@ export async function proxy(request:Request):Promise<Response> {
     const {body,prefs,reason}=await personalize(structuredClone(original),protocol,client,session);
     decisions.push({action:"personalization",reason});
     const outputTokens=boundOutput(body,{...route,protocol});
-    await db.getRepository(ClientSchema).update(client.id,{lastUsedAt:Date.now()});
+    if(!client.lastUsedAt||Date.now()-client.lastUsedAt>=60_000){client.lastUsedAt=Date.now();void db.getRepository(ClientSchema).update(client.id,{lastUsedAt:client.lastUsedAt}).catch(()=>{});}
     let lastError:ApiError|undefined;
     if(session?.providerId && !route.targets.some(t=>t.providerId===session.providerId && t.model===session.model))throw new ApiError(409,"pinned_target_removed");
     const targets=session?.providerId?route.targets.filter(t=>t.providerId===session.providerId && t.model===session.model):await balancedTargets(route);
@@ -158,12 +158,13 @@ export async function proxy(request:Request):Promise<Response> {
       const touch=()=>{clearTimeout(idleTimer);idleTimer=setTimeout(()=>controller.abort(new Error("upstream_idle_timeout")),60000);};touch();
       const timeout=setTimeout(()=>controller.abort(new Error("upstream_timeout")),300000);
       let submitted=false,rejected=true,terminal=false,responseStatus="unknown",usage=emptyUsage(),failure:string|null=null;
-      // 进行中的实时进度：每 500ms 落一次已耗时/已写字节/当前 token。
+      // ponytail: progress is approximate; batch it to reduce SQLite writes, final traffic state remains exact.
+      // 进行中的实时进度：每 2s 落一次已耗时/已写字节/当前 token。
       // 首字节到达前没有任何写入钩子，正是「等待时长看不到」的直接原因，这个定时器覆盖那段。
       let bytesTotal=0;
       const progressTimer=setInterval(()=>{
         void db.getRepository(TrafficSchema).update(traffic.id,{latencyMs:Date.now()-started,firstByteMs:traffic.firstByteMs,firstTokenMs:traffic.firstTokenMs,bytesTotal,inputTokens:usage.inputTokens,outputTokens:usage.outputTokens,progressAt:Date.now()}).catch(()=>{});
-      },500);
+      },2000);
       let finishPromise:Promise<void>|undefined;
       const cancel=()=>controller.abort(new Error("client_cancelled"));
       request.signal.addEventListener("abort",cancel,{once:true});

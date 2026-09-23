@@ -79,3 +79,15 @@ bun src/cli.ts storage compact
 MCP `/mcp` 额外提供 `gateway_cli(command, args)` 工具，以及 `pgw://gateway/...` JSON 资源；资源和查询遵循客户端的 `memoryAccess` 与项目范围。
 
 MCP 只复用现有 `/api` 查询，不复制业务逻辑；启动、写入、运行控制和 `storage compact` 仍保留在 CLI/API，不通过这个只读工具暴露。
+
+### 安装并使用 Personal Gateway Skill
+
+1. 打开网关 → **设置 → 访问密钥 → 创建**，按需填写项目路径；在 **MCP 权限** 中打开记忆访问，或只勾选需要的能力。
+2. 创建后只会显示一次完整密钥。复制页面里的 **Skill 说明**；不要把密钥提交到仓库或写入公开日志。
+3. 安装到 Agent：
+   - 临时使用：直接复制页面里的 `curl` / `fetch` 示例，设置 `PGW_MCP_KEY`。
+   - Claude Code / Codex：复制页面里的 `pgw --access CLIENT_ID ...` 命令；网关会生成隔离的 MCP 配置。
+   - 持久使用：把 **Skill 说明** 保存为 `SKILL.md`，放进任一授权的 Skills 目录；回到 **资产 → Skills → 来源 → 扫描**，确认网关已发现它。
+4. 使用时让 Agent 先调用 `gateway_cli`，例如 `{ "command": "skills", "args": ["--query", "搜索词"] }`。也可以读取 `pgw://gateway/status`、`pgw://gateway/sessions` 等 JSON 资源。
+
+这个 Skill 只开放只读查询：状态、会话、偏好、Skills、MCP、任务和导出；启动 Agent、审批、写入配置与 `storage compact` 仍需通过网关原有 CLI/UI/API 完成。
