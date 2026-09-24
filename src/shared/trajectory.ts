@@ -1,16 +1,25 @@
 import type { CaptureStage } from "./types";
 
-export type TrajectorySection = "system" | "messages" | "tools" | "config" | "transport" | "output" | "other";
+export type TrajectorySection =
+  "system" | "messages" | "tools" | "config" | "transport" | "output" | "other";
 export interface TrajectoryBlock {
   id: string;
   section: TrajectorySection;
-  kind: "text" | "reasoning" | "message" | "tool_call" | "tool_result" | "tool_schema" | "value";
+  kind:
+    | "text"
+    | "reasoning"
+    | "message"
+    | "tool_call"
+    | "tool_result"
+    | "tool_schema"
+    | "value";
   role: string | null;
   name: string | null;
   callId: string | null;
   value: unknown;
 }
-export type TrajectoryCoverage = "complete" | "recording" | "partial" | "not_captured" | "expired" | "deleted";
+export type TrajectoryCoverage =
+  "complete" | "recording" | "partial" | "not_captured" | "expired" | "deleted";
 export interface TrajectoryProjection {
   blocks: TrajectoryBlock[];
   format: "json" | "sse" | "text";
@@ -25,7 +34,11 @@ export interface TrajectoryWindow {
   format: TrajectoryProjection["format"];
   warnings: string[];
   sections: { name: TrajectorySection; count: number }[];
-  blocks: (Omit<TrajectoryBlock, "value"> & { preview: string; length: number; truncated: boolean })[];
+  blocks: (Omit<TrajectoryBlock, "value"> & {
+    preview: string;
+    length: number;
+    truncated: boolean;
+  })[];
   total: number;
   next: number | null;
 }
@@ -60,7 +73,16 @@ export interface TrajectorySession {
 }
 export interface TrajectoryNode {
   id: string;
-  kind: "model_call" | "message" | "tool_call" | "tool_result" | "compaction" | "branch" | "runtime" | "approval" | "metadata";
+  kind:
+    | "model_call"
+    | "message"
+    | "tool_call"
+    | "tool_result"
+    | "compaction"
+    | "branch"
+    | "runtime"
+    | "approval"
+    | "metadata";
   title: string;
   status: string;
   at: number | null;
@@ -76,18 +98,51 @@ export interface TrajectoryNode {
   inputTokens: number | null;
   outputTokens: number | null;
   requestId: string | null;
-  relations: (TrajectoryEvidence & { relation: "tool_result_of" | "attempt_of"; target: string; callId: string | null })[];
-  source: { kind: "traffic" | "session_event" | "run_event" | "approval" | "mcp_call"; id: string };
+  relations: (TrajectoryEvidence & {
+    relation: "tool_result_of" | "attempt_of";
+    target: string;
+    callId: string | null;
+  })[];
+  source: {
+    kind: "traffic" | "session_event" | "run_event" | "approval" | "mcp_call";
+    id: string;
+  };
 }
-export interface TrajectorySessionPage { items: TrajectorySession[]; next: string | null }
-export interface TrajectoryNodePage { session: TrajectorySession; items: TrajectoryNode[]; next: number | null; total: number; revision: string; links: (TrajectoryEvidence & { key: string; title: string })[] }
+export interface TrajectorySessionPage {
+  items: TrajectorySession[];
+  next: string | null;
+}
+export interface TrajectoryNodePage {
+  session: TrajectorySession;
+  items: TrajectoryNode[];
+  next: number | null;
+  total: number;
+  revision: string;
+  links: (TrajectoryEvidence & { key: string; title: string })[];
+}
 
 export type ContextSnapshotKind = TrajectoryNode["source"]["kind"];
 export interface ContextSnapshot {
-  id: string; createdAt: number; expiresAt: number; label: string; hash: string;
-  sessionKey: string; nodeKind: ContextSnapshotKind; nodeId: string;
+  id: string;
+  createdAt: number;
+  expiresAt: number;
+  label: string;
+  hash: string;
+  sessionKey: string;
+  nodeKind: ContextSnapshotKind;
+  nodeId: string;
   state: "writing" | "ready" | "failed" | "deleted" | "expired";
-  bytes: number; coverage: TrajectoryCoverage;
-  stages: { name: CaptureStage | "node"; coverage: TrajectoryCoverage; bytes: number; hash: string; reason: string | null }[];
+  bytes: number;
+  coverage: TrajectoryCoverage;
+  stages: {
+    name: CaptureStage | "node";
+    coverage: TrajectoryCoverage;
+    bytes: number;
+    hash: string;
+    reason: string | null;
+  }[];
 }
-export interface ContextSnapshotPage { items: ContextSnapshot[]; next: number | null }
+export interface ContextSnapshotPage {
+  items: ContextSnapshot[];
+  next: number | null;
+}

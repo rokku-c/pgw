@@ -1,29 +1,96 @@
 import { atomic } from "./transactions";
-import { encrypt,decrypt,ApiError } from "./security";
-import type { CapturePolicy,CaptureStage } from "../shared/types";
+import { encrypt, decrypt, ApiError } from "./security";
+import {
+  appendCaptureBlocks,
+  newCaptureStorageKey,
+  readCaptureBlock,
+  removeCaptureFiles,
+  reconcileCaptureFiles,
+} from "./capture-files";
+import type { CapturePolicy, CaptureStage } from "../shared/types";
 
-interface State {id:string;policy:CapturePolicy;secrets:string[];meta:Record<string,unknown>;counts:Map<string,number>;lengths:Map<string,number>;pending:Map<string,string>;decoders:Map<string,TextDecoder>;partial:boolean;reason:string|null}
-const states=new Map<string,State>();
-let chain=Promise.resolve(),lastSweep=0;
-const defaultPolicy:CapturePolicy={enabled:true,revision:3,retentionDays:7,maxStageBytes:16*1024*1024,maxStorageBytes:512*1024*1024};
+interface State {
+  id: string;
+  fileKey: string;
+  policy: CapturePolicy;
+  secrets: string[];
+  meta: Record<string, unknown>;
+  counts: Map<string, number>;
+  lengths: Map<string, number>;
+  pending: Map<string, string>;
+  decoders: Map<string, TextDecoder>;
+  partial: boolean;
+  reason: string | null;
+}
+const states = new Map<string, State>();
+let chain = Promise.resolve(),
+  lastSweep = 0;
+const defaultPolicy: CapturePolicy = {
+  enabled: true,
+  revision: 3,
+  retentionDays: 7,
+  maxStageBytes: 16 * 1024 * 1024,
+  maxStorageBytes: 512 * 1024 * 1024,
+};
 /** 配额吃紧时优先放弃的阶段：这两个在流式下按 delta 增长，是体量的绝对大头。 */
-const DELTA_STAGES=["response","output"];
-function policy(database:any):CapturePolicy{const row=database.query("SELECT value FROM settings WHERE id='observability'").get();return row?JSON.parse(row.value):defaultPolicy;}
-function scrubText(text:string){return text;}
-function scrub(value:any):any{return value;}
+const DELTA_STAGES = ["response", "output"];
+function policy(database: any): CapturePolicy {
+  const row = database
+    .query("SELECT value FROM settings WHERE id='observability'")
+    .get();
+  return row ? JSON.parse(row.value) : defaultPolicy;
+}
+function scrubText(text: string) {
+  return text;
+}
+function scrub(value: any): any {
+  return value;
+}
 /** 配额的唯一真源：真实占用的分块表。写路径与 sweep 都必须用它，否则两者会漂移。 */
-function usedBytes(database:any){return (database.query('SELECT coalesce(sum(bytes),0) n FROM request_capture_parts').get() as {n:number}).n;}
+function usedBytes(database: any) {
+  return (
+    database
+      .query("SELECT coalesce(sum(bytes),0) n FROM request_capture_parts")
+      .get() as { n: number }
+  ).n;
+}
 /** 每阶段体量（用于记录淘汰明细）。 */
-function stageUsage(database:any,requestId:string,only?:string[]){
-  const clause=only?.length?` AND stage IN (${only.map(()=>"?").join(",")})`:"";
-  return database.query(`SELECT stage,sum(bytes) bytes,count(*) chunks FROM request_capture_parts WHERE requestId=?${clause} GROUP BY stage`).all(requestId,...(only||[])) as {stage:string;bytes:number;chunks:number}[];
+function stageUsage(database: any, requestId: string, only?: string[]) {
+  const clause = only?.length
+    ? ` AND stage IN (${only.map(() => "?").join(",")})`
+    : "";
+  return database
+    .query(
+      `SELECT stage,sum(bytes) bytes,count(*) chunks FROM request_capture_parts WHERE requestId=?${clause} GROUP BY stage`,
+    )
+    .all(requestId, ...(only || [])) as {
+    stage: string;
+    bytes: number;
+    chunks: number;
+  }[];
 }
 /** 淘汰明细并入既有记录（同一阶段可能被多轮淘汰）。 */
-function mergeEvicted(previous:string|null,incoming:{stage:string;bytes:number;chunks:number}[]){
-  const merged:Record<string,{stage:string;bytes:number;chunks:number}>={};
-  const parsed=JSON.parse(previous||"[]");
-  for(const item of Array.isArray(parsed)?parsed:[])merged[item.stage]=item;
-  for(const item of incoming){const found=merged[item.stage];merged[item.stage]=found?{stage:item.stage,bytes:found.bytes+item.bytes,chunks:found.chunks+item.chunks}:item;}
+function mergeEvicted(
+  previous: string | null,
+  incoming: { stage: string; bytes: number; chunks: number }[],
+) {
+  const merged: Record<
+    string,
+    { stage: string; bytes: number; chunks: number }
+  > = {};
+  const parsed = JSON.parse(previous || "[]");
+  for (const item of Array.isArray(parsed) ? parsed : [])
+    merged[item.stage] = item;
+  for (const item of incoming) {
+    const found = merged[item.stage];
+    merged[item.stage] = found
+      ? {
+          stage: item.stage,
+          bytes: found.bytes + item.bytes,
+          chunks: found.chunks + item.chunks,
+        }
+      : item;
+  }
   return Object.values(merged);
 }
 /**
@@ -32,131 +99,559 @@ function mergeEvicted(previous:string|null,incoming:{stage:string;bytes:number;c
  * 二级：仍超限才对最早的整条丢内容（state=expired、bytes=0）。
  * `keepId` 是正在写入的抓取，绝不淘汰它自己。返回是否已降到 limit 以下。
  */
-function evict(database:any,limit:number,keepId:string|null){
-  let used=usedBytes(database);
-  if(used<=limit)return true;
-  const clause=keepId?"AND requestId!=?":"";
-  const rows=database.query(`SELECT requestId,evictedStages FROM request_captures WHERE state NOT IN ('deleted','expired') ${clause} ORDER BY createdAt LIMIT 200`).all(...(keepId?[keepId]:[])) as {requestId:string;evictedStages:string|null}[];
-  for(const row of rows){
-    if(used<=limit)break;
-    const delta=stageUsage(database,row.requestId,DELTA_STAGES);
-    if(!delta.length)continue;
-    const bytes=delta.reduce((n,d)=>n+d.bytes,0);
-    database.query(`DELETE FROM request_capture_parts WHERE requestId=? AND stage IN (${DELTA_STAGES.map(()=>"?").join(",")})`).run(row.requestId,...DELTA_STAGES);
+function evict(database: any, limit: number, keepId: string | null) {
+  let used = usedBytes(database);
+  if (used <= limit) return true;
+  const clause = keepId ? "AND requestId!=?" : "";
+  const rows = database
+    .query(
+      `SELECT requestId,evictedStages FROM request_captures WHERE state NOT IN ('deleted','expired') ${clause} ORDER BY createdAt LIMIT 200`,
+    )
+    .all(...(keepId ? [keepId] : [])) as {
+    requestId: string;
+    evictedStages: string | null;
+  }[];
+  for (const row of rows) {
+    if (used <= limit) break;
+    const delta = stageUsage(database, row.requestId, DELTA_STAGES);
+    if (!delta.length) continue;
+    const bytes = delta.reduce((n, d) => n + d.bytes, 0);
+    database
+      .query(
+        `DELETE FROM request_capture_parts WHERE requestId=? AND stage IN (${DELTA_STAGES.map(() => "?").join(",")})`,
+      )
+      .run(row.requestId, ...DELTA_STAGES);
     // state 不动：recording 行必须保持 recording，否则在途写入会被自己判成 stopped。
-    database.query("UPDATE request_captures SET bytes=MAX(0,bytes-?),evictedStages=?,reason='storage_limit',updatedAt=? WHERE requestId=?").run(bytes,JSON.stringify(mergeEvicted(row.evictedStages,delta)),Date.now(),row.requestId);
-    used-=bytes;
+    database
+      .query(
+        "UPDATE request_captures SET bytes=MAX(0,bytes-?),evictedStages=?,reason='storage_limit',updatedAt=? WHERE requestId=?",
+      )
+      .run(
+        bytes,
+        JSON.stringify(mergeEvicted(row.evictedStages, delta)),
+        Date.now(),
+        row.requestId,
+      );
+    used -= bytes;
   }
-  for(const row of rows){
-    if(used<=limit)break;
-    const rest=stageUsage(database,row.requestId);
-    if(!rest.length)continue;
-    const bytes=rest.reduce((n,d)=>n+d.bytes,0);
-    database.query("DELETE FROM request_capture_parts WHERE requestId=?").run(row.requestId);
-    database.query("UPDATE request_captures SET state='expired',reason='storage_limit',bytes=0,evictedStages=?,metadataCipher=?,updatedAt=? WHERE requestId=?").run(JSON.stringify(mergeEvicted(row.evictedStages,rest)),encrypt('{}'),Date.now(),row.requestId);
+  for (const row of rows) {
+    if (used <= limit) break;
+    const rest = stageUsage(database, row.requestId);
+    if (!rest.length) continue;
+    const bytes = rest.reduce((n, d) => n + d.bytes, 0);
+    database
+      .query("DELETE FROM request_capture_parts WHERE requestId=?")
+      .run(row.requestId);
+    database
+      .query(
+        "UPDATE request_captures SET state='expired',reason='storage_limit',bytes=0,evictedStages=?,metadataCipher=?,updatedAt=? WHERE requestId=?",
+      )
+      .run(
+        JSON.stringify(mergeEvicted(row.evictedStages, rest)),
+        encrypt("{}"),
+        Date.now(),
+        row.requestId,
+      );
     states.delete(row.requestId);
-    used-=bytes;
+    used -= bytes;
   }
-  return used<=limit;
+  return used <= limit;
 }
-async function sweep(){
-  await atomic(database=>{
-    const current=policy(database);const now=Date.now();
-    const expired=database.query("SELECT requestId FROM request_captures WHERE state NOT IN ('deleted','expired') AND expiresAt<=? LIMIT 100").all(now) as {requestId:string}[];
-    for(const row of expired){const usage=stageUsage(database,row.requestId);database.query('DELETE FROM request_capture_parts WHERE requestId=?').run(row.requestId);database.query("UPDATE request_captures SET state='expired',reason='retention_expired',bytes=0,evictedStages=?,metadataCipher=?,updatedAt=? WHERE requestId=?").run(JSON.stringify(mergeEvicted(null,usage)),encrypt('{}'),now,row.requestId);states.delete(row.requestId);}
-    if(current?.enabled)evict(database,current.maxStorageBytes,null);
-  });lastSweep=Date.now();
-}
-async function store(state:State,stage:string,text:string){
-  const bytes=Buffer.from(text,"utf8");
-  // 先在内存里按 32KB 与阶段预算切好块，再一次性落库：一次 flush 一个事务，
-  // 「每块一次配额聚合」也随之降为「每次 flush 一次」。
-  const parts:{bytes:number;cipher:string}[]=[];let position=0,used=state.lengths.get(stage)||0;
-  while(position<bytes.length){
-    const remaining=state.policy.maxStageBytes-used;
-    if(remaining<=0){state.partial=true;state.reason="stage_limit";break;}
-    let end=Math.min(position+32768,bytes.length,position+remaining);
-    while(end<bytes.length&&(bytes[end]&0xc0)===0x80)end--;
-    if(end<=position){state.partial=true;state.reason="stage_limit";break;}
-    const part=bytes.subarray(position,end);
-    parts.push({bytes:part.length,cipher:encrypt(part.toString("utf8"))});
-    used+=part.length;position=end;
-  }
-  if(!parts.length)return;
-  const first=state.counts.get(stage)||0,total=parts.reduce((n,part)=>n+part.bytes,0);
-  const stored=await atomic(database=>{
-    const current=policy(database);const row=database.query('SELECT state FROM request_captures WHERE requestId=?').get(state.id) as {state:string}|null;
-    if(!current?.enabled||current.revision!==state.policy.revision||!row||row.state!=="recording")return "stopped";
-    // 配额吃紧时先腾地方再写，而不是拒绝新内容：记录本身必须落下来。
-    if(usedBytes(database)+total>current.maxStorageBytes){
-      evict(database,current.maxStorageBytes-total,state.id);
-      if(usedBytes(database)+total>current.maxStorageBytes)return "storage_limit";
+/**
+ * Migrate legacy encrypted SQLite chunks to the external compressed capture files.
+ * Older databases have bodyCipher populated and no file offsets; convert one capture
+ * at a time so startup memory stays bounded and a failed conversion leaves the row
+ * readable through the legacy fallback path.
+ */
+async function migrateLegacyCaptures() {
+  const rows = await atomic((database) =>
+    database
+      .query(
+        "SELECT requestId FROM request_captures WHERE captureFile IS NULL AND state NOT IN ('deleted','expired') AND EXISTS (SELECT 1 FROM request_capture_parts p WHERE p.requestId=request_captures.requestId AND p.bodyCipher<>'') ORDER BY createdAt LIMIT 32",
+      )
+      .all() as { requestId: string }[],
+  );
+  for (const row of rows) {
+    const parts = await atomic((database) =>
+      database
+        .query(
+          "SELECT stage,sequence,bodyCipher FROM request_capture_parts WHERE requestId=? AND bodyCipher<>'' ORDER BY stage,sequence",
+        )
+        .all(row.requestId) as {
+        stage: string;
+        sequence: number;
+        bodyCipher: string;
+      }[],
+    );
+    if (!parts.length) continue;
+    const fileKey = newCaptureStorageKey();
+    const offsets: {
+      stage: string;
+      sequence: number;
+      offset: number;
+      length: number;
+    }[] = [];
+    try {
+      for (const stage of [...new Set(parts.map((part) => part.stage))]) {
+        const stageParts = parts.filter((part) => part.stage === stage);
+        const stageOffsets = await appendCaptureBlocks(
+          fileKey,
+          stage,
+          stageParts.map((part) => Buffer.from(decrypt(part.bodyCipher), "utf8")),
+        );
+        stageParts.forEach((part, index) =>
+          offsets.push({
+            stage,
+            sequence: part.sequence,
+            offset: stageOffsets[index].offset,
+            length: stageOffsets[index].length,
+          }),
+        );
+      }
+      const committed = await atomic((database) => {
+        const current = database
+          .query("SELECT captureFile FROM request_captures WHERE requestId=?")
+          .get(row.requestId) as { captureFile: string | null } | null;
+        if (current?.captureFile) return false;
+        const update = database.query(
+          "UPDATE request_capture_parts SET bodyCipher='',fileOffset=?,fileLength=? WHERE requestId=? AND stage=? AND sequence=?",
+        );
+        for (const item of offsets)
+          update.run(
+            item.offset,
+            item.length,
+            row.requestId,
+            item.stage,
+            item.sequence,
+          );
+        database
+          .query(
+            "UPDATE request_captures SET captureFile=?,updatedAt=? WHERE requestId=?",
+          )
+          .run(fileKey, Date.now(), row.requestId);
+        return true;
+      });
+      if (!committed) await removeCaptureFiles(fileKey);
+    } catch (error) {
+      await removeCaptureFiles(fileKey).catch(() => {});
+      throw error;
     }
-    const insert=database.query('INSERT INTO request_capture_parts(requestId,stage,sequence,bytes,bodyCipher) VALUES(?,?,?,?,?)');
-    for(const [index,part]of parts.entries())insert.run(state.id,stage,first+index,part.bytes,part.cipher);
-    database.query('UPDATE request_captures SET bytes=bytes+?,updatedAt=? WHERE requestId=?').run(total,Date.now(),state.id);return "stored";
+  }
+}
+
+async function cleanupCaptureFiles() {
+  const references = await atomic((database) => {
+    const rows = database.query(
+      "SELECT c.captureFile,p.stage,MAX(p.fileOffset+p.fileLength) endOffset FROM request_captures c JOIN request_capture_parts p ON p.requestId=c.requestId WHERE c.captureFile IS NOT NULL AND p.fileOffset IS NOT NULL GROUP BY c.captureFile,p.stage",
+    ).all() as { captureFile: string; stage: string; endOffset: number }[];
+    const result = new Map<string, Map<string, number>>();
+    for (const row of rows) {
+      const stages = result.get(row.captureFile) || new Map<string, number>();
+      stages.set(row.stage, row.endOffset);
+      result.set(row.captureFile, stages);
+    }
+    return result;
   });
-  if(stored!=="stored"){state.partial=true;state.reason=stored;return;}
-  state.counts.set(stage,first+parts.length);state.lengths.set(stage,used);
+  await reconcileCaptureFiles(references);
+}
+async function sweep() {
+  await migrateLegacyCaptures();
+  await atomic((database) => {
+    const current = policy(database);
+    const now = Date.now();
+    const expired = database
+      .query(
+        "SELECT requestId FROM request_captures WHERE state NOT IN ('deleted','expired') AND expiresAt<=? LIMIT 100",
+      )
+      .all(now) as { requestId: string }[];
+    for (const row of expired) {
+      const usage = stageUsage(database, row.requestId);
+      database
+        .query("DELETE FROM request_capture_parts WHERE requestId=?")
+        .run(row.requestId);
+      database
+        .query(
+          "UPDATE request_captures SET state='expired',reason='retention_expired',bytes=0,evictedStages=?,metadataCipher=?,updatedAt=? WHERE requestId=?",
+        )
+        .run(
+          JSON.stringify(mergeEvicted(null, usage)),
+          encrypt("{}"),
+          now,
+          row.requestId,
+        );
+      states.delete(row.requestId);
+    }
+    if (current?.enabled) evict(database, current.maxStorageBytes, null);
+  });
+  await cleanupCaptureFiles();
+  lastSweep = Date.now();
+}
+async function store(state: State, stage: string, text: string) {
+  const bytes = Buffer.from(text, "utf8");
+  const parts: Buffer[] = [];
+  let position = 0,
+    used = state.lengths.get(stage) || 0;
+  while (position < bytes.length) {
+    const remaining = state.policy.maxStageBytes - used;
+    if (remaining <= 0) {
+      state.partial = true;
+      state.reason = "stage_limit";
+      break;
+    }
+    let end = Math.min(position + 32768, bytes.length, position + remaining);
+    while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
+    if (end <= position) {
+      state.partial = true;
+      state.reason = "stage_limit";
+      break;
+    }
+    parts.push(bytes.subarray(position, end));
+    used += end - position;
+    position = end;
+  }
+  if (!parts.length) return;
+  const first = state.counts.get(stage) || 0,
+    total = parts.reduce((n, part) => n + part.length, 0);
+  // Keep the existing logical-byte quota semantics. The file append happens only
+  // after capacity is reserved; SQLite then stores a tiny seek index per block.
+  const reserved = await atomic((database) => {
+    const current = policy(database);
+    const row = database
+      .query("SELECT state FROM request_captures WHERE requestId=?")
+      .get(state.id) as { state: string } | null;
+    if (!current?.enabled || current.revision !== state.policy.revision || !row || row.state !== "recording")
+      return false;
+    if (usedBytes(database) + total > current.maxStorageBytes) {
+      evict(database, current.maxStorageBytes - total, state.id);
+      if (usedBytes(database) + total > current.maxStorageBytes) return false;
+    }
+    return true;
+  });
+  if (!reserved) {
+    state.partial = true;
+    state.reason = "storage_limit";
+    return;
+  }
+  const offsets = await appendCaptureBlocks(state.fileKey, stage, parts);
+  const stored = await atomic((database) => {
+    const row = database.query("SELECT state FROM request_captures WHERE requestId=?").get(state.id) as {state:string}|null;
+    if (!row || row.state !== "recording") return false;
+    const insert = database.query(
+      "INSERT INTO request_capture_parts(requestId,stage,sequence,bytes,bodyCipher,fileOffset,fileLength) VALUES(?,?,?,?,'',?,?)",
+    );
+    parts.forEach((part, index) => insert.run(state.id, stage, first + index, part.length, offsets[index].offset, offsets[index].length));
+    database.query("UPDATE request_captures SET bytes=bytes+?,updatedAt=? WHERE requestId=?")
+      .run(total, Date.now(), state.id);
+    return true;
+  });
+  if (!stored) {
+    state.partial = true;
+    state.reason = "capture_write_failed";
+    return;
+  }
+  state.counts.set(stage, first + parts.length);
+  state.lengths.set(stage, used);
   await Bun.sleep(0);
 }
 
-async function handle(message:any){
-  if(message.type==="sweep"){await sweep();return;}
-  if(message.type==="clear"){states.clear();return;}
-  if(message.type==="begin"){
-    if(Date.now()-lastSweep>60000)await sweep();
-    const meta=scrub(message.metadata);
-    const now=Date.now();
-    await atomic(database=>{database.query("INSERT OR IGNORE INTO request_captures(requestId,requestGroupId,policyRevision,state,createdAt,updatedAt,expiresAt,bytes,metadataCipher) VALUES(?,?,?,'recording',?,?,?,0,?)").run(message.requestId,message.requestGroupId,message.policy.revision,now,now,now+message.policy.retentionDays*86400000,encrypt(JSON.stringify(meta)));});
-    states.set(message.requestId,{id:message.requestId,policy:message.policy,secrets:message.secrets,meta,counts:new Map(),lengths:new Map(),pending:new Map(),decoders:new Map(),partial:false,reason:null});return;
+async function handle(message: any) {
+  if (message.type === "sweep") {
+    await sweep();
+    return;
   }
-  const state=states.get(message.requestId);if(!state)return;
-  if(message.type==="secret"){state.secrets.push(message.value);return;}
-  if(message.type==="metadata"){state.meta={...state.meta,...scrub(message.value)};return;}
-  if(message.type==="json"){await store(state,message.stage,JSON.stringify(scrub(message.value),null,2));return;}
-  if(message.type==="chunk"){
-    const decoder=state.decoders.get(message.stage)||new TextDecoder();state.decoders.set(message.stage,decoder);
-    let pending=(state.pending.get(message.stage)||"")+decoder.decode(message.chunk,{stream:true});
-    if(pending.length>32768){let cut=pending.length-1024;if(/[\uD800-\uDBFF]/.test(pending[cut-1]))cut--;await store(state,message.stage,pending.slice(0,cut));pending=pending.slice(cut);}
-    state.pending.set(message.stage,pending);return;
+  if (message.type === "clear") {
+    states.clear();
+    return;
   }
-  if(message.type==="end"){
-    for(const [stage,pending]of state.pending){await store(state,stage,scrubText(pending+(state.decoders.get(stage)?.decode()||"")));}
-    state.meta={...state.meta,status:message.status,error:message.error};if(message.dropped){state.partial=true;state.reason="capture_queue_limit";}
-    await atomic(database=>database.query("UPDATE request_captures SET state=?,reason=?,metadataCipher=?,updatedAt=? WHERE requestId=? AND state='recording'").run(state.partial?"partial":"complete",state.reason,encrypt(JSON.stringify(state.meta)),Date.now(),state.id));states.delete(state.id);
+  if (message.type === "begin") {
+    if (Date.now() - lastSweep > 60000) await sweep();
+    const meta = scrub(message.metadata);
+    const now = Date.now();
+    const fileKey = newCaptureStorageKey();
+    await atomic((database) => {
+      database
+        .query(
+          "INSERT OR IGNORE INTO request_captures(requestId,requestGroupId,policyRevision,state,createdAt,updatedAt,expiresAt,bytes,metadataCipher,captureFile) VALUES(?,?,?,'recording',?,?,?,0,?,?)",
+        )
+        .run(
+          message.requestId,
+          message.requestGroupId,
+          message.policy.revision,
+          now,
+          now,
+          now + message.policy.retentionDays * 86400000,
+          encrypt(JSON.stringify(meta)),
+          fileKey,
+        );
+    });
+    states.set(message.requestId, {
+      id: message.requestId,
+      fileKey,
+      policy: message.policy,
+      secrets: message.secrets,
+      meta,
+      counts: new Map(),
+      lengths: new Map(),
+      pending: new Map(),
+      decoders: new Map(),
+      partial: false,
+      reason: null,
+    });
+    return;
   }
-}
-async function read(operation:string,args:any){
-  if(operation==="deleteAll"){await atomic(database=>{database.query('DELETE FROM request_capture_parts').run();database.query("UPDATE request_captures SET state='deleted',bytes=0,reason='deleted',metadataCipher=?,updatedAt=?").run(encrypt('{}'),Date.now());});states.clear();return {ok:true};}
-  if(operation==="delete"){await atomic(database=>{database.query('DELETE FROM request_capture_parts WHERE requestId=?').run(args.id);database.query("UPDATE request_captures SET state='deleted',bytes=0,reason='deleted',metadataCipher=?,updatedAt=? WHERE requestId=?").run(encrypt('{}'),Date.now(),args.id);});states.delete(args.id);return {ok:true};}
-  const row=await atomic(database=>database.query('SELECT * FROM request_captures WHERE requestId=?').get(args.id) as any);
-  if(!row){if(operation==="info")return {requestId:args.id,requestGroupId:"",state:"not_captured",createdAt:0,updatedAt:0,expiresAt:0,bytes:0,reason:"not_captured",metadata:{},stages:[],evictedStages:[]};if(operation==="stage")return {text:"",next:null,bytes:0,complete:false};throw new ApiError(404,"capture_not_found");}
-  if(row.expiresAt<=Date.now()&&!['deleted','expired'].includes(row.state)){await atomic(database=>{const usage=stageUsage(database,args.id);database.query('DELETE FROM request_capture_parts WHERE requestId=?').run(args.id);database.query("UPDATE request_captures SET state='expired',bytes=0,reason='retention_expired',evictedStages=?,metadataCipher=?,updatedAt=? WHERE requestId=?").run(JSON.stringify(mergeEvicted(row.evictedStages,usage)),encrypt('{}'),Date.now(),args.id);});states.delete(args.id);if(operation==="info")return {requestId:args.id,requestGroupId:row.requestGroupId,state:"expired",createdAt:row.createdAt,updatedAt:Date.now(),expiresAt:row.expiresAt,bytes:0,reason:"retention_expired",metadata:{},stages:[],evictedStages:JSON.parse(row.evictedStages||"[]")};throw new ApiError(410,"capture_expired");}
-  if(operation==="info"){
-    const stages=await atomic(database=>database.query('SELECT stage,sum(bytes) bytes,count(*) chunks FROM request_capture_parts WHERE requestId=? GROUP BY stage').all(args.id));
-    const {metadataCipher,policyRevision,...rest}=row;
-    const evicted=JSON.parse(row.evictedStages||"[]");
-    return {...rest,metadata:JSON.parse(decrypt(metadataCipher)),stages,evictedStages:Array.isArray(evicted)?evicted:[]};
+  const state = states.get(message.requestId);
+  if (!state) return;
+  if (message.type === "secret") {
+    state.secrets.push(message.value);
+    return;
   }
-  if(['deleted','expired'].includes(row.state))throw new ApiError(410,"capture_expired");
-  let stage=args.stage as string;
-  const fallback=stage==="output"&&JSON.parse(decrypt(row.metadataCipher)).outputSource==="response";
-  if(fallback)stage="response";
-  const parts=await atomic(database=>database.query('SELECT sequence,bytes,bodyCipher FROM request_capture_parts WHERE requestId=? AND stage=? AND sequence>? ORDER BY sequence LIMIT 3').all(args.id,stage,args.after) as {sequence:number;bytes:number;bodyCipher:string}[]);
-  const more=parts.length>2;if(more)parts.pop();return {text:parts.map(p=>decrypt(p.bodyCipher)).join(""),next:more?parts.at(-1)!.sequence:null,bytes:parts.reduce((n,p)=>n+p.bytes,0),complete:row.state==="complete",fallback};
-}
-(globalThis as any).onmessage=(event:MessageEvent)=>{
-  const message=event.data;
-  chain=chain.then(async()=>{
-    if(message.type==="read"){
-      try{const result=await read(message.operation,message.args);(globalThis as any).postMessage({type:"read",sequence:message.sequence,result});}
-      catch(error){(globalThis as any).postMessage({type:"read",sequence:message.sequence,error:error instanceof ApiError?error.code:"capture_unavailable",status:error instanceof ApiError?error.status:500});}
-    }else{
-      try{await handle(message);}catch{const state=states.get(message.requestId);if(state){state.partial=true;state.reason="capture_write_failed";}}
-      finally{(globalThis as any).postMessage({type:"ack",sequence:message.sequence});}
+  if (message.type === "metadata") {
+    state.meta = { ...state.meta, ...scrub(message.value) };
+    return;
+  }
+  if (message.type === "json") {
+    await store(
+      state,
+      message.stage,
+      JSON.stringify(scrub(message.value), null, 2),
+    );
+    return;
+  }
+  if (message.type === "chunk") {
+    const decoder = state.decoders.get(message.stage) || new TextDecoder();
+    state.decoders.set(message.stage, decoder);
+    let pending =
+      (state.pending.get(message.stage) || "") +
+      decoder.decode(message.chunk, { stream: true });
+    if (pending.length > 32768) {
+      let cut = pending.length - 1024;
+      if (/[\uD800-\uDBFF]/.test(pending[cut - 1])) cut--;
+      await store(state, message.stage, pending.slice(0, cut));
+      pending = pending.slice(cut);
     }
-  }).catch(()=>{});
+    state.pending.set(message.stage, pending);
+    return;
+  }
+  if (message.type === "end") {
+    for (const [stage, pending] of state.pending) {
+      await store(
+        state,
+        stage,
+        scrubText(pending + (state.decoders.get(stage)?.decode() || "")),
+      );
+    }
+    state.meta = {
+      ...state.meta,
+      status: message.status,
+      error: message.error,
+    };
+    if (message.dropped) {
+      state.partial = true;
+      state.reason = "capture_queue_limit";
+    }
+    await atomic((database) =>
+      database
+        .query(
+          "UPDATE request_captures SET state=?,reason=?,metadataCipher=?,updatedAt=? WHERE requestId=? AND state='recording'",
+        )
+        .run(
+          state.partial ? "partial" : "complete",
+          state.reason,
+          encrypt(JSON.stringify(state.meta)),
+          Date.now(),
+          state.id,
+        ),
+    );
+    states.delete(state.id);
+  }
+}
+async function read(operation: string, args: any) {
+  if (operation === "deleteAll") {
+    const keys = await atomic((database) => database.query("SELECT captureFile FROM request_captures WHERE captureFile IS NOT NULL").all() as {captureFile:string}[]);
+    await atomic((database) => {
+      database.query("DELETE FROM request_capture_parts").run();
+      database
+        .query(
+          "UPDATE request_captures SET state='deleted',bytes=0,reason='deleted',metadataCipher=?,updatedAt=?",
+        )
+        .run(encrypt("{}"), Date.now());
+    });
+    await Promise.all(keys.map(({captureFile}) => removeCaptureFiles(captureFile)));
+    states.clear();
+    return { ok: true };
+  }
+  if (operation === "delete") {
+    const key = await atomic((database) => (database.query("SELECT captureFile FROM request_captures WHERE requestId=?").get(args.id) as {captureFile:string|null}|null)?.captureFile || null);
+    await atomic((database) => {
+      database
+        .query("DELETE FROM request_capture_parts WHERE requestId=?")
+        .run(args.id);
+      database
+        .query(
+          "UPDATE request_captures SET state='deleted',bytes=0,reason='deleted',metadataCipher=?,updatedAt=? WHERE requestId=?",
+        )
+        .run(encrypt("{}"), Date.now(), args.id);
+    });
+    await removeCaptureFiles(key);
+    states.delete(args.id);
+    return { ok: true };
+  }
+  const row = await atomic(
+    (database) =>
+      database
+        .query("SELECT * FROM request_captures WHERE requestId=?")
+        .get(args.id) as any,
+  );
+  if (!row) {
+    if (operation === "info")
+      return {
+        requestId: args.id,
+        requestGroupId: "",
+        state: "not_captured",
+        createdAt: 0,
+        updatedAt: 0,
+        expiresAt: 0,
+        bytes: 0,
+        reason: "not_captured",
+        metadata: {},
+        stages: [],
+        evictedStages: [],
+      };
+    if (operation === "stage")
+      return { text: "", next: null, bytes: 0, complete: false };
+    throw new ApiError(404, "capture_not_found");
+  }
+  if (
+    row.expiresAt <= Date.now() &&
+    !["deleted", "expired"].includes(row.state)
+  ) {
+    await atomic((database) => {
+      const usage = stageUsage(database, args.id);
+      database
+        .query("DELETE FROM request_capture_parts WHERE requestId=?")
+        .run(args.id);
+      database
+        .query(
+          "UPDATE request_captures SET state='expired',bytes=0,reason='retention_expired',evictedStages=?,metadataCipher=?,updatedAt=? WHERE requestId=?",
+        )
+        .run(
+          JSON.stringify(mergeEvicted(row.evictedStages, usage)),
+          encrypt("{}"),
+          Date.now(),
+          args.id,
+        );
+    });
+    states.delete(args.id);
+    await cleanupCaptureFiles();
+    if (operation === "info")
+      return {
+        requestId: args.id,
+        requestGroupId: row.requestGroupId,
+        state: "expired",
+        createdAt: row.createdAt,
+        updatedAt: Date.now(),
+        expiresAt: row.expiresAt,
+        bytes: 0,
+        reason: "retention_expired",
+        metadata: {},
+        stages: [],
+        evictedStages: JSON.parse(row.evictedStages || "[]"),
+      };
+    throw new ApiError(410, "capture_expired");
+  }
+  if (operation === "info") {
+    const stages = await atomic((database) =>
+      database
+        .query(
+          "SELECT stage,sum(bytes) bytes,count(*) chunks FROM request_capture_parts WHERE requestId=? GROUP BY stage",
+        )
+        .all(args.id),
+    );
+    const { metadataCipher, policyRevision, captureFile, ...rest } = row;
+    const evicted = JSON.parse(row.evictedStages || "[]");
+    return {
+      ...rest,
+      metadata: JSON.parse(decrypt(metadataCipher)),
+      stages,
+      evictedStages: Array.isArray(evicted) ? evicted : [],
+    };
+  }
+  if (["deleted", "expired"].includes(row.state))
+    throw new ApiError(410, "capture_expired");
+  let stage = args.stage as string;
+  const fallback =
+    stage === "output" &&
+    JSON.parse(decrypt(row.metadataCipher)).outputSource === "response";
+  if (fallback) stage = "response";
+  const parts = await atomic(
+    (database) =>
+      database
+        .query(
+          "SELECT sequence,bytes,bodyCipher,fileOffset,fileLength FROM request_capture_parts WHERE requestId=? AND stage=? AND sequence>? ORDER BY sequence LIMIT 3",
+        )
+        .all(args.id, stage, args.after) as {
+        sequence: number;
+        bytes: number;
+        bodyCipher: string | null;
+        fileOffset: number | null;
+        fileLength: number | null;
+      }[],
+  );
+  const more = parts.length > 2;
+  if (more) parts.pop();
+  return {
+    text: (await Promise.all(parts.map(async (p) =>
+      p.fileOffset != null && p.fileLength != null && row.captureFile
+        ? (await readCaptureBlock(row.captureFile, stage, p.fileOffset, p.fileLength)).toString("utf8")
+        : decrypt(p.bodyCipher || ""),
+    ))).join(""),
+    next: more ? parts.at(-1)!.sequence : null,
+    bytes: parts.reduce((n, p) => n + p.bytes, 0),
+    complete: row.state === "complete",
+    fallback,
+  };
+}
+(globalThis as any).onmessage = (event: MessageEvent) => {
+  const message = event.data;
+  chain = chain
+    .then(async () => {
+      if (message.type === "read") {
+        try {
+          const result = await read(message.operation, message.args);
+          (globalThis as any).postMessage({
+            type: "read",
+            sequence: message.sequence,
+            result,
+          });
+        } catch (error) {
+          (globalThis as any).postMessage({
+            type: "read",
+            sequence: message.sequence,
+            error:
+              error instanceof ApiError ? error.code : "capture_unavailable",
+            status: error instanceof ApiError ? error.status : 500,
+          });
+        }
+      } else {
+        try {
+          await handle(message);
+        } catch {
+          const state = states.get(message.requestId);
+          if (state) {
+            state.partial = true;
+            state.reason = "capture_write_failed";
+          }
+        } finally {
+          (globalThis as any).postMessage({
+            type: "ack",
+            sequence: message.sequence,
+          });
+        }
+      }
+    })
+    .catch(() => {});
 };
 /** 定期跑保留期与配额清理。原先只有配置变更与 60s 懒触发会跑，配额超限后可能长时间无人回收。 */
-setInterval(()=>{chain=chain.then(()=>sweep()).catch(()=>{});},60000);
+setInterval(() => {
+  chain = chain.then(() => sweep()).catch(() => {});
+}, 60000);

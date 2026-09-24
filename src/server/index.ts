@@ -10,12 +10,15 @@ import { closeBudgetStore } from "./budget";
 import { acquireOwnership } from "./ownership";
 import { checkLocalRequest, ApiError } from "./security";
 import { address, port, adminToken, writeDevAccessFile } from "./config";
-import { closeCaptures } from "./observability";
+import { closeCaptures, startCaptureMaintenance } from "./observability";
 
 let ready = false;
 const pwaDirectory = `${import.meta.dir}/../web/pwa`;
 
-async function handle(request: Request, handler: (request: Request) => Promise<Response>) {
+async function handle(
+  request: Request,
+  handler: (request: Request) => Promise<Response>,
+) {
   try {
     checkLocalRequest(request);
     if (!ready) throw new ApiError(503, "gateway_starting");
@@ -25,28 +28,64 @@ async function handle(request: Request, handler: (request: Request) => Promise<R
     response.headers.set("referrer-policy", "no-referrer");
     return response;
   } catch (error) {
-    const status = error instanceof ApiError ? error.status : error instanceof z.ZodError ? 400 : 500;
-    const code = error instanceof ApiError ? error.code : error instanceof z.ZodError ? "invalid_input" : "internal_error";
+    const status =
+      error instanceof ApiError
+        ? error.status
+        : error instanceof z.ZodError
+          ? 400
+          : 500;
+    const code =
+      error instanceof ApiError
+        ? error.code
+        : error instanceof z.ZodError
+          ? "invalid_input"
+          : "internal_error";
     if (status === 500) console.error(error);
-    return Response.json({ error: { code, message: code, ...(error instanceof z.ZodError ? { fields: error.issues.map(i => i.path.join(".")) } : {}) } }, { status, headers: { "cache-control": "no-store", ...(error instanceof ApiError && error.requestId ? { "x-pgw-request-id": error.requestId } : {}) } });
+    return Response.json(
+      {
+        error: {
+          code,
+          message: code,
+          ...(error instanceof z.ZodError
+            ? { fields: error.issues.map((i) => i.path.join(".")) }
+            : {}),
+        },
+      },
+      {
+        status,
+        headers: {
+          "cache-control": "no-store",
+          ...(error instanceof ApiError && error.requestId
+            ? { "x-pgw-request-id": error.requestId }
+            : {}),
+        },
+      },
+    );
   }
 }
 const server = Bun.serve({
-  hostname: "127.0.0.1", port, idleTimeout: 255,
-  development: process.env.NODE_ENV === "development" ? { hmr: true, console: true } : false,
+  hostname: "127.0.0.1",
+  port,
+  idleTimeout: 255,
+  development:
+    process.env.NODE_ENV === "development"
+      ? { hmr: true, console: true }
+      : false,
   routes: {
     "/": page,
     "/app": page,
     "/app/*": page,
     "/pwa/icon-192.png": new Response(Bun.file(`${pwaDirectory}/icon-192.png`)),
     "/pwa/icon-512.png": new Response(Bun.file(`${pwaDirectory}/icon-512.png`)),
-    "/api/*": request => handle(request, api),
-    "/providers/*": request => handle(request, proxy),
-    "/v1/*": request => handle(request, proxy),
-    "/v1beta/*": request => handle(request, proxy),
-    "/mcp": request => handle(request, handleMcp),
+    "/api/*": (request) => handle(request, api),
+    "/providers/*": (request) => handle(request, proxy),
+    "/v1/*": (request) => handle(request, proxy),
+    "/v1beta/*": (request) => handle(request, proxy),
+    "/mcp": (request) => handle(request, handleMcp),
   },
-  fetch() { return Response.json({ error: { code: "not_found" } }, { status: 404 }); },
+  fetch() {
+    return Response.json({ error: { code: "not_found" } }, { status: 404 });
+  },
 });
 let releaseOwnership: (() => void) | undefined;
 try {
@@ -56,6 +95,7 @@ try {
   if (accessFile) console.log(`  Development access: ${accessFile}`);
   await audit("gateway.started", "local");
   startScheduler();
+  startCaptureMaintenance();
   ready = true;
 } catch (error) {
   await server.stop(true);
