@@ -1,7 +1,5 @@
 import type zh from "./zh-CN";
 const messages = {
-  "settings.awarenessPrompt": "Context awareness prompt",
-
   "trajectory.filter.calls": "Model calls",
   "trajectory.filter.events": "Events",
 
@@ -166,6 +164,8 @@ const messages = {
   "language.zh": "简体中文",
   "language.en": "English",
   "language.switch": "Language",
+  "theme.light": "Switch to light theme",
+  "theme.dark": "Switch to dark theme",
   "brand.name": "personal",
   "brand.sub": "gateway",
   "workspace.name": "Personal workspace",
@@ -697,6 +697,40 @@ const messages = {
   "error.targetRootMissing": "Target directory not found",
   "error.skillDirectory": "Invalid directory name",
   "error.deploymentState": "Installation state changed; refresh",
-  "error.targetNotSkill": "Target is not a skill directory; replacement blocked"
+  "error.targetNotSkill": "Target is not a skill directory; replacement blocked",
+
+  "nav.control": "Control",
+  "page.overview.title": "Overview",
+  "page.overview.description": "A compact view of gateway health, throughput, and recent activity.",
+  "page.control.title": "Control",
+  "page.models.description": "Configure upstream providers, logical routes, and client access.",
+  "page.traffic.description": "Read requests as a sequence of stages, attempts, and related session calls.",
+  "page.observability.description": "Follow an agent trajectory from session to node evidence.",
+  "page.sessions.description": "Browse local sessions, events, and searchable working memory.",
+  "page.registry.description": "Manage local agents, skills, asset roots, deployments, and MCP.",
+  "page.persona.description": "Manage preferences, history, evidence, and event-derived candidates.",
+  "page.runs.description": "Inspect agent runs, progress, controls, and execution results.",
+  "page.playground.description": "Execute a real gateway request and inspect every debug attempt.",
+  "page.jobs.description": "Inspect job progress, results, attempts, and retry/cancel actions.",
+  "page.control.description": "Handle approvals, routing state, MCP calls, and runtime controls.",
+  "page.settings.description": "Gateway policies, capture limits, adaptive context, retries, and storage.",
+  "common.refresh": "Refresh",
+  "common.back": "Back",
+  "common.addPreference": "Add preference",
+  "common.fromEvent": "From event",
+  "common.openTraffic": "Open traffic",
+  "common.scanRegistry": "Scan assets",
+  "common.exportInventory": "Export inventory",
+  "common.detail": "Detail",
+  "common.inspect": "Inspect",
+  "common.delete": "Delete",
+  "common.actions": "Actions",
+  "common.status": "Status",
+  "common.created": "Created",
+  "common.noRecords": "No records",
+  "common.noRequests": "No requests yet",
+  "common.noJobs": "No jobs",
+  "common.runRequest": "Run a request to inspect the response",
+  "common.gatewayOnline": "Gateway online"
 } satisfies Record<keyof typeof zh, string>;
 export default messages;

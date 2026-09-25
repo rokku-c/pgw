@@ -1,62 +1,35 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
 import zh from "./locales/zh-CN";
 import en from "./locales/en-US";
 
-export type Locale = "zh-CN" | "en-US";
-export type I18nKey = keyof typeof zh;
-const catalogs = { "zh-CN": zh, "en-US": en };
-function detectLocale(): Locale {
-  try { const saved=localStorage.getItem("pgw.locale"); if(saved==="zh-CN"||saved==="en-US")return saved; } catch {}
-  if(typeof navigator!=="undefined") for(const language of navigator.languages||[navigator.language]) {
-    if(language.toLowerCase().startsWith("zh"))return "zh-CN";
-    if(language.toLowerCase().startsWith("en"))return "en-US";
-  }
-  return "zh-CN";
+type Locale = "zh-CN" | "en-US";
+const dictionaries = { "zh-CN": zh, "en-US": en } as const;
+type Key = keyof typeof zh;
+
+const literalKeys: Partial<Record<string, Key>> = {
+  "Workspace": "workspace.name", "LOCAL WORKSPACE": "workspace.local", "Search": "nav.search",
+  "Overview": "nav.overview", "Models": "nav.models", "Traffic": "nav.traffic", "Observe": "nav.observability", "Observability": "nav.observability", "Sessions": "nav.sessions", "Registry": "nav.registry", "Persona": "nav.persona", "Runs": "nav.runs", "Playground": "nav.playground", "Jobs": "nav.jobs", "Control": "nav.control", "Settings": "nav.settings",
+  "Refresh": "common.refresh", "Back": "common.back", "Cancel": "common.cancel", "Save": "common.save", "Create": "common.create", "Confirm": "common.confirm", "Retry": "common.retry", "Run": "common.run", "Stop": "common.stop", "Continue": "common.resume", "Loading": "common.loading", "Copy": "common.copy", "Copied": "common.copied", "Close": "common.close", "Execute": "common.execute", "Restore": "common.restore", "Reject": "common.reject", "Disable": "common.disable", "Enable": "common.enable", "Read": "common.read", "History": "common.history", "Scan": "common.scan", "Edit": "common.edit", "Export": "common.export", "Collapse": "common.collapse", "Submit": "common.submit",
+  "Add preference": "common.addPreference", "From event": "common.fromEvent", "Open traffic": "common.openTraffic", "Scan assets": "common.scanRegistry", "Export inventory": "common.exportInventory", "Detail": "common.detail", "Inspect": "common.inspect", "Delete": "common.delete", "Actions": "common.actions", "Status": "common.status", "Created": "common.created", "No records": "common.noRecords", "No requests yet": "common.noRequests", "No jobs": "common.noJobs", "Run a request to inspect the response": "common.runRequest", "Gateway online": "common.gatewayOnline",
+  "Local": "status.local", "Disconnected": "status.disconnected", "Switch to light theme": "theme.light", "Switch to dark theme": "theme.dark",
+  "A compact view of gateway health, throughput, and recent activity.": "page.overview.description", "Configure upstream providers, logical routes, and client access.": "page.models.description", "Read requests as a sequence of stages, attempts, and related session calls.": "page.traffic.description", "Follow an agent trajectory from session to node evidence.": "page.observability.description", "Browse local sessions, events, and searchable working memory.": "page.sessions.description", "Manage local agents, skills, asset roots, deployments, and MCP.": "page.registry.description", "Manage preferences, history, evidence, and event-derived candidates.": "page.persona.description", "Inspect agent runs, progress, controls, and execution results.": "page.runs.description", "Execute a real gateway request and inspect every debug attempt.": "page.playground.description", "Inspect job progress, results, attempts, and retry/cancel actions.": "page.jobs.description", "Handle approvals, routing state, MCP calls, and runtime controls.": "page.control.description", "Gateway policies, capture limits, adaptive context, retries, and storage.": "page.settings.description",
+};
+
+const I18nContext = createContext({ locale: "zh-CN" as Locale, setLocale: (_: Locale) => {}, t: (key: string) => key, translate: (value: string) => value });
+
+export function I18nProvider({ children }: { children: ReactNode }) {
+  const [locale, setLocale] = useState<Locale>(() => (localStorage.getItem("pgw-locale") as Locale) || "zh-CN");
+  const value = useMemo(() => ({
+    locale,
+    setLocale: (next: Locale) => { localStorage.setItem("pgw-locale", next); setLocale(next); },
+    t: (key: string) => (dictionaries[locale] as Record<string, string>)[key] || (dictionaries["en-US"] as Record<string, string>)[key] || key,
+    translate: (literal: string) => {
+      const key = literalKeys[literal];
+      return key ? (dictionaries[locale] as Record<string, string>)[key] || literal : literal;
+    },
+  }), [locale]);
+  return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
 }
-let activeLocale:Locale=detectLocale();
-export function jobLabel(job:{kind:string;label:string}) {
-  const keys:Record<string,I18nKey>={"trajectory.snapshot":"trajectory.snapshot.save","trajectory.cleanup":"trajectory.snapshot.cleanup","registry.scan":"job.label.registry","sessions.scan":"job.label.sessions","sessions.search":"job.label.search","sessions.timeline":"job.label.sessionRead","model.debug":"job.label.model","assets.scan":"job.label.assetScan","assets.search":"job.label.assetSearch","assets.inspect":"job.label.assetRead","assets.snapshot":"job.label.assetSnapshot","assets.preview":"job.label.assetPreview","assets.apply":"job.label.assetApply","assets.restore":"job.label.assetRestore"};
-  return keys[job.kind]?tr(keys[job.kind]):job.label;
-}
-export function getLocale(){return activeLocale;}
-export function isMessageKey(value:string):value is I18nKey{return Object.hasOwn(zh,value);}
-export function trError(value:string|undefined){return value&&isMessageKey(value)?tr(value):value||"";}
-export function tr(key:I18nKey,params:Record<string,string|number|undefined>={}) {
-  const template=catalogs[activeLocale][key];
-  if(template===undefined)return key;
-  return template.replace(/\{([a-zA-Z][a-zA-Z0-9]*)\}/g,(placeholder,name)=>params[name]===undefined?placeholder:String(params[name]));
-}
-export function formatNumber(value:number){return new Intl.NumberFormat(activeLocale,{notation:value>=10000?"compact":"standard",maximumFractionDigits:1}).format(value);}
-export function formatMoney(micros:number){return new Intl.NumberFormat(activeLocale,{style:"currency",currency:"USD",minimumFractionDigits:2,maximumFractionDigits:4}).format(micros/1_000_000);}
-/** 字节按 1024 进制显示；小于 1KB 保持整数字节，便于与小体量抓取对照。 */
-export function formatBytes(value:number){
-  const units=["B","KB","MB","GB","TB"];let size=value,unit=0;
-  while(size>=1024&&unit<units.length-1){size/=1024;unit++;}
-  return `${new Intl.NumberFormat(activeLocale,{maximumFractionDigits:unit===0?0:1}).format(size)} ${units[unit]}`;
-}
-export function formatDate(timestamp:number){return new Intl.DateTimeFormat(activeLocale,{dateStyle:"medium",timeStyle:"short"}).format(timestamp);}
-export function formatTime(timestamp:number){return new Intl.DateTimeFormat(activeLocale,{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).format(timestamp);}
-export function formatRelative(timestamp:number){
-  const seconds=Math.floor((Date.now()-timestamp)/1000);
-  if(Math.abs(seconds)<60)return tr("common.time.now");
-  const [value,unit]=Math.abs(seconds)<3600?[Math.trunc(-seconds/60),"minute"] as const:Math.abs(seconds)<86400?[Math.trunc(-seconds/3600),"hour"] as const:[Math.trunc(-seconds/86400),"day"] as const;
-  return new Intl.RelativeTimeFormat(activeLocale,{numeric:"auto",style:"short"}).format(value,unit);
-}
-const Context=createContext({locale:activeLocale,setLocale:(_locale:Locale)=>{},t:tr,number:formatNumber,money:formatMoney,date:formatDate});
-export function I18nProvider({children}:{children:ReactNode}) {
-  const [locale,setValue]=useState<Locale>(activeLocale);
-  const setLocale=(value:Locale)=>{
-    activeLocale=value;setValue(value);
-    try{localStorage.setItem("pgw.locale",value);}catch{}
-    document.documentElement.lang=value;
-  };
-  useEffect(()=>{
-    document.documentElement.lang=activeLocale;
-    const sync=(event:StorageEvent)=>{if(event.key==="pgw.locale"&&(event.newValue==="zh-CN"||event.newValue==="en-US")){activeLocale=event.newValue;setValue(event.newValue);document.documentElement.lang=event.newValue;}};
-    window.addEventListener("storage",sync);return()=>window.removeEventListener("storage",sync);
-  },[]);
-  const context=useMemo(()=>({locale,setLocale,t:tr,number:formatNumber,money:formatMoney,date:formatDate}),[locale]);
-  return <Context.Provider value={context}>{children}</Context.Provider>;
-}
-export const useI18n=()=>useContext(Context);
-export function LanguageSwitch(){const{locale,setLocale,t}=useI18n();return <button className="language-switch" onClick={()=>setLocale(locale==="zh-CN"?"en-US":"zh-CN")} aria-label={t("language.switch")} title={locale==="zh-CN"?t("language.en"):t("language.zh")}><span>{locale==="zh-CN"?"中":"EN"}</span></button>;}
+
+export const useI18n = () => useContext(I18nContext);
+export type LocaleKey = Key;

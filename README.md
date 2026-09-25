@@ -2,26 +2,95 @@
 
 ## 安装
 
+安装包默认提供原生 CLI，浏览器 UI 不是使用 CLI 的前置条件。只需要命令行时，直接安装并使用 `pgw`：
+
 ### 本地仓库
 
 ```sh
 bun link
-pgw open
+pgw --help
+pgw doctor
 ```
 
 ### GitHub
 
 ```sh
 bun install -g github:rokku-c/pgw
-pgw open
+pgw --version
+pgw status
 ```
 
 全局安装后可在任意目录使用 `pgw`。
+
+需要浏览器 UI 时再启动 UI：
+
+```sh
+pgw ui
+```
+
+`pgw open` 保持兼容，也会启动网关并打开 UI；`bun run ui` 是源码仓库中的等价启动方式。只运行 API、诊断、查询或托管任务时，不需要打开浏览器。
+
+CLI 使用 Commander 命令树，支持脚本友好的输出和退出码：`--help`/`-h` 查看帮助，`--version`/`-v` 查看版本，`--json` 输出纯 JSON，`--raw` 输出完整缩进 JSON，`--quiet` 抑制正常输出；未知命令退出码为 `2`，运行时错误退出码为 `1`。默认人类输出是摘要和表格，错误始终写入 stderr。
+
+```sh
+pgw --json --version
+pgw --json status
+pgw --json doctor
+pgw --json definitely-not-a-command
+```
+
+### 命令树
+
+```text
+pgw
+├─ status | doctor | dashboard/traffic [list|get|capture|delete-capture]
+├─ sources | sessions | persona | preferences | skills
+├─ source [add|edit|remove|restore|pause|scan]
+├─ asset-roots [list|create|patch|scan|delete]
+├─ assets [list|inspect|snapshot|preview|deployments|apply|restore]
+├─ asset-installs | export/inventory | scan
+├─ providers | routes | clients | settings
+├─ observability [settings|update|captures]
+├─ trajectory [sessions|calls|snapshots]
+├─ jobs [list|get|attempts|attempt|cancel|retry]
+├─ mcp [list|catalog|create|patch|delete|probe|history|tool|call|resource|prompt]
+├─ mcp-calls [list|get|approve|deny|cancel]
+├─ approvals | approve | deny
+├─ routing [sessions|circuits|delete-session|reset-circuit]
+├─ runs [get|events|budget] | run [codex|claude|pi]
+├─ pause | resume | steer | stop | complete
+├─ claude | codex | pi
+└─ storage [status|usage|compact|purge]
+```
+
+列表默认使用紧凑表格，可用筛选和机器输出：
+
+```sh
+pgw sessions --query "项目决策" --limit 20
+pgw jobs --limit 10 --offset 20
+pgw --json providers
+pgw --raw sessions
+pgw settings patch --body '{"protocolConversion":true}' --confirm
+pgw run codex --goal "整理项目文档" --timeout 30m
+pgw source edit SOURCE_ID --body '{"name":"Sessions","agent":"auto","path":"/tmp/sessions","enabled":true,"captureBodies":false,"learn":true}' --confirm
+pgw mcp probe CONNECTION_ID
+pgw mcp-calls approve CALL_ID --confirm
+pgw trajectory sessions nodes 'scanned:SESSION_ID'
+pgw trajectory calls diff TRAFFIC_ID --against OTHER_TRAFFIC_ID
+pgw jobs list --status failed --kind sessions.scan
+pgw runs events RUN_ID
+pgw traffic list --status failed --limit 20
+pgw traffic capture TRAFFIC_ID --stage response
+pgw routing circuits
+```
+
+`pgw` 本身不会启动浏览器；只有显式运行 `pgw ui`/`pgw open` 才打开 UI。安装 CLI-only 不需要浏览器依赖或手动启动 UI，UI 仍作为同一包中的可选运行入口提供。
 
 ## 本地开发
 
 ```sh
 bun install
+bun run cli --help
 bun run start
 ```
 

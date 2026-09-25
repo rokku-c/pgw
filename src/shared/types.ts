@@ -23,7 +23,8 @@ export type Page =
   | "runs"
   | "settings"
   | "jobs"
-  | "playground";
+  | "playground"
+  | "control";
 export interface RecordBase {
   id: string;
   createdAt: number;
